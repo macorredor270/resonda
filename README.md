@@ -8,7 +8,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/M1KE-27/resonda/releases/latest"><b>⬇ Descargas</b></a> ·
+  <a href="https://github.com/macorredor270/resonda/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/macorredor270/resonda?label=versi%C3%B3n&color=00d4ff"></a>
+  <a href="LICENSE"><img alt="Licencia" src="https://img.shields.io/badge/licencia-MIT-00d4ff"></a>
+  <img alt="Lenguaje" src="https://img.shields.io/badge/rust-stable-00d4ff">
+  <img alt="Dependencias de descarga" src="https://img.shields.io/badge/yt--dlp%20%2F%20ffmpeg-cero-4cc38a">
+</p>
+
+<p align="center">
+  <a href="https://github.com/macorredor270/resonda/releases/latest"><b>⬇ Descargas</b></a> ·
   <a href="#libre-de-verdad">Libre</a> ·
   <a href="#todo-hecho-aquí">Todo hecho aquí</a> ·
   <a href="#librerías-que-usamos">Librerías</a> ·
@@ -19,7 +26,7 @@
 
 ## Descargas
 
-Todo lo compilado está en la página de [**Releases**](https://github.com/M1KE-27/resonda/releases/latest):
+Todo lo compilado está en la página de [**Releases**](https://github.com/macorredor270/resonda/releases/latest):
 
 | Sistema | Archivo | Qué es |
 |---|---|---|
