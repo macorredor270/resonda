@@ -106,6 +106,43 @@ make clean      # borra lo compilado: el proyecto vuelve a ocupar unos 400 KB
 
 Requisitos: Rust; para la ventana, Qt 6.5 o superior (Quick, QuickControls2 y Svg), CMake y Ninja.
 
+### Compilar en Arch y otras distros
+
+Los paquetes de [Releases](#descargas) (`.deb`, AppImage, `.exe`) cubren Debian/Ubuntu, cualquier
+distro vía AppImage y Windows. Para Arch (y en general cualquier distro sin paquete propio) se
+compila desde el código — es rápido, `resonda -f mp3 -b 256 <enlace>` está listo a los pocos
+segundos de tener los requisitos instalados.
+
+**Arch / Manjaro / EndeavourOS:**
+
+```sh
+sudo pacman -S --needed rust qt6-base qt6-declarative qt6-svg cmake ninja
+git clone https://github.com/macorredor270/resonda.git && cd resonda
+make cli && make gui
+```
+
+**Fedora:**
+
+```sh
+sudo dnf install rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg-devel cmake ninja-build
+```
+
+**openSUSE:**
+
+```sh
+sudo zypper install rust cargo qt6-base-devel qt6-declarative-devel qt6-svg-devel cmake ninja
+```
+
+**Debian / Ubuntu (compilando en vez de usar el `.deb`):**
+
+```sh
+sudo apt install cargo qt6-base-dev qt6-declarative-dev libqt6svg6-dev cmake ninja-build
+```
+
+Solo hace falta Qt para `make gui`; `make cli` (la terminal) compila con Rust a secas, sin ninguna
+dependencia del sistema más allá del propio compilador. Si `cmake` no encuentra Qt, exporta
+`CMAKE_PREFIX_PATH` apuntando a su instalación (p. ej. Qt instalado a mano en `~/Qt/6.x/gcc_64`).
+
 ```sh
 resonda -f mp3 -b 256 <enlace>      # YouTube o Spotify (canción, álbum o playlist)
 resonda -q 1080 <enlace>            # vídeo MP4 a 1080p
