@@ -9,7 +9,9 @@
 
 use crate::pipeline::{self, Output, Stage, Target};
 use crate::sources::spotify::{self, Collection};
-use crate::sources::youtube::{self, Kind, VideoInfo};
+use crate::sources::{find_catalog, Catalog};
+use crate::sources::youtube::{Kind, VideoInfo};
+use crate::sources::{self, EXTRACTORS};
 use crate::{new_agent, Cancelled, Res};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -45,6 +47,8 @@ pub struct RsInfo {
     info: VideoInfo,
     title: CString,
     id: CString,
+    service: CString,
+    cover: CString,
 }
 
 pub struct RsCancel(AtomicBool);
@@ -94,6 +98,41 @@ pub unsafe extern "C" fn rs_string_free(s: *mut c_char) {
     }
 }
 
+/// Nombres de los servicios (extractores y catálogos) como cadenas C.
+fn service_names() -> &'static [(CString, CString)] {
+    static NAMES: std::sync::OnceLock<Vec<(CString, CString)>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let extractors = EXTRACTORS.iter().map(|e| (to_c(e.id()), to_c(e.name())));
+        extractors.chain(crate::sources::CATALOGS.iter().map(|c| (to_c(c.id()), to_c(c.name())))).collect()
+    })
+}
+
+/// Servicio al que pertenece un enlace o ID: devuelve su identificador ("youtube", "tiktok"...) o
+/// NULL si no se reconoce. La cadena es estática: no se libera.
+#[no_mangle]
+pub unsafe extern "C" fn rs_service_id_of(input: *const c_char) -> *const c_char {
+    service_of(input).map_or(std::ptr::null(), |(id, _)| id.as_ptr())
+}
+
+/// Igual que `rs_service_id_of`, pero con el nombre para mostrar ("YouTube", "TikTok"...).
+#[no_mangle]
+pub unsafe extern "C" fn rs_service_name_of(input: *const c_char) -> *const c_char {
+    service_of(input).map_or(std::ptr::null(), |(_, name)| name.as_ptr())
+}
+
+unsafe fn service_of(input: *const c_char) -> Option<&'static (CString, CString)> {
+    if input.is_null() {
+        return None;
+    }
+    let input = CStr::from_ptr(input).to_str().ok()?.trim();
+    let names = service_names();
+    let id = match find_catalog(input) {
+        Some((catalog, _, _)) => catalog.id(),
+        None => sources::find(input)?.id(),
+    };
+    names.iter().find(|(i, _)| i.to_bytes() == id.as_bytes())
+}
+
 /// Consulta un vídeo (URL o ID). Devuelve NULL si falla y deja el motivo en `*err`.
 #[no_mangle]
 pub unsafe extern "C" fn rs_info_fetch(input: *const c_char, err: *mut *mut c_char) -> *mut RsInfo {
@@ -103,13 +142,18 @@ pub unsafe extern "C" fn rs_info_fetch(input: *const c_char, err: *mut *mut c_ch
         }
         let input = CStr::from_ptr(input).to_str().map_err(|_| "La URL no es UTF-8 válido")?;
         let agent = new_agent();
-        let info = youtube::get_video_info(&agent, input.trim())?;
-        Ok(Box::new(RsInfo { agent, title: to_c(&info.title), id: to_c(&info.id), info }))
+        let info = sources::fetch_info(&agent, input.trim())?;
+        let cover = match (info.service, &info.cover_url) {
+            (_, Some(url)) => url.clone(),
+            ("youtube", None) => format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", info.id),
+            _ => String::new(),
+        };
+        Ok(Box::new(RsInfo { agent, title: to_c(&info.title), id: to_c(&info.id), service: to_c(info.service), cover: to_c(&cover), info }))
     });
     match result {
         Ok(b) => Box::into_raw(b),
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             std::ptr::null_mut()
         }
     }
@@ -128,7 +172,19 @@ pub unsafe extern "C" fn rs_info_title(info: *const RsInfo) -> *const c_char {
     info.as_ref().map_or(std::ptr::null(), |i| i.title.as_ptr())
 }
 
-/// ID de 11 caracteres (propiedad de `info`).
+/// Identificador del servicio de origen: "youtube", "tiktok"... (propiedad de `info`).
+#[no_mangle]
+pub unsafe extern "C" fn rs_info_service(info: *const RsInfo) -> *const c_char {
+    info.as_ref().map_or(std::ptr::null(), |i| i.service.as_ptr())
+}
+
+/// URL de la miniatura o portada; puede ser "" (propiedad de `info`).
+#[no_mangle]
+pub unsafe extern "C" fn rs_info_cover(info: *const RsInfo) -> *const c_char {
+    info.as_ref().map_or(std::ptr::null(), |i| i.cover.as_ptr())
+}
+
+/// ID del vídeo en su servicio (propiedad de `info`).
 #[no_mangle]
 pub unsafe extern "C" fn rs_info_id(info: *const RsInfo) -> *const c_char {
     info.as_ref().map_or(std::ptr::null(), |i| i.id.as_ptr())
@@ -148,7 +204,7 @@ pub unsafe extern "C" fn rs_info_heights(info: *const RsInfo, out: *mut u32, cap
         .info
         .formats
         .iter()
-        .filter(|f| f.kind == Kind::Video && (f.codec == "avc1" || f.codec == "av01"))
+        .filter(|f| (f.kind == Kind::Video && (f.codec == "avc1" || f.codec == "av01")) || (f.kind == Kind::Muxed && f.codec == "avc1"))
         .map(|f| f.height)
         .collect();
     heights.sort_unstable_by(|a, b| b.cmp(a));
@@ -233,7 +289,8 @@ pub unsafe extern "C" fn rs_download(
 
         let never = AtomicBool::new(false);
         let flag = cancel.as_ref().map_or(&never, |c| &c.0);
-        pipeline::execute(&info.agent, &info.info, &plan, &out, Target { output, tags: None }, &on_progress, flag)?;
+        let tags = audio_only.then(|| pipeline::info_tags(&info.agent, &info.info));
+        pipeline::execute(&info.agent, &info.info, &plan, &out, Target { output, tags: tags.as_ref() }, &on_progress, flag)?;
         Ok(out)
     });
 
@@ -246,7 +303,7 @@ pub unsafe extern "C" fn rs_download(
         }
         Err(e) if e.downcast_ref::<Cancelled>().is_some() => RS_CANCELLED,
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             RS_ERROR
         }
     }
@@ -256,19 +313,21 @@ pub unsafe extern "C" fn rs_download(
 
 pub struct RsSpotify {
     agent: ureq::Agent,
+    catalog: &'static dyn Catalog,
     collection: Collection,
     name: CString,
     cover: CString,
     labels: Vec<CString>,
 }
 
-/// 1 si `input` es un enlace o URI de Spotify (canción, álbum o playlist).
+/// 1 si `input` es un enlace de un catálogo de música (Spotify, Deezer, Apple Music, Tidal: canción,
+/// álbum o playlist). El nombre es histórico: antes solo existía Spotify.
 #[no_mangle]
 pub unsafe extern "C" fn rs_is_spotify_link(input: *const c_char) -> c_int {
     if input.is_null() {
         return 0;
     }
-    CStr::from_ptr(input).to_str().ok().and_then(spotify::parse_link).is_some() as c_int
+    CStr::from_ptr(input).to_str().ok().and_then(find_catalog).is_some() as c_int
 }
 
 /// Lee los datos (no el audio) de un enlace de Spotify. Devuelve NULL si falla (motivo en `*err`).
@@ -279,17 +338,17 @@ pub unsafe extern "C" fn rs_spotify_fetch(input: *const c_char, err: *mut *mut c
             return Err("Enlace vacío".into());
         }
         let text = CStr::from_ptr(input).to_str().map_err(|_| "El enlace no es UTF-8 válido")?;
-        let (kind, id) = spotify::parse_link(text).ok_or("No es un enlace de Spotify válido")?;
+        let (catalog, kind, id) = find_catalog(text).ok_or("No es un enlace de un catálogo de música soportado")?;
         let agent = new_agent();
-        let collection = spotify::fetch(&agent, kind, &id)?;
+        let collection = catalog.fetch(&agent, kind, &id)?;
         let cover = collection.tracks.first().and_then(|t| t.cover_url.clone()).unwrap_or_default();
         let labels = collection.tracks.iter().map(|t| to_c(&t.label())).collect();
-        Ok(Box::new(RsSpotify { agent, name: to_c(&collection.name), cover: to_c(&cover), labels, collection }))
+        Ok(Box::new(RsSpotify { agent, catalog, name: to_c(&collection.name), cover: to_c(&cover), labels, collection }))
     });
     match result {
         Ok(b) => Box::into_raw(b),
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             std::ptr::null_mut()
         }
     }
@@ -368,7 +427,7 @@ pub unsafe extern "C" fn rs_spotify_download(
         };
         // Spotify es solo música: el vídeo MP4 se sustituye por M4A
         let (output, _) = output_of(if format == RS_FORMAT_MP4 { RS_FORMAT_M4A } else { format }, bitrate_kbps)?;
-        let track = if s.collection.kind == spotify::Kind::Track { track.clone() } else { spotify::refine(&s.agent, track) };
+        let track = if s.collection.kind == spotify::Kind::Track { track.clone() } else { s.catalog.refine(&s.agent, track) };
         let user = &user;
         let on_progress = move |stage: Stage, done: u64, total: u64| {
             if let Some(cb) = progress {
@@ -377,7 +436,13 @@ pub unsafe extern "C" fn rs_spotify_download(
         };
         let never = AtomicBool::new(false);
         let flag = cancel.as_ref().map_or(&never, |c| &c.0);
-        pipeline::download_spotify_track(&s.agent, &track, &dir, None, output, &on_progress, flag)
+        // Si hay canciones con el mismo nombre antes que esta, se numera para no pisarlas (la ventana
+        // baja las canciones de una en una, así que el nombre sale de su posición en la lista)
+        let mut used = std::collections::HashSet::new();
+        let ext = output.extension(true);
+        let path = s.collection.tracks.iter().take(i + 1).map(|t| pipeline::unique_track_path(&dir, t, ext, &mut used)).last();
+        let path = if s.collection.kind == spotify::Kind::Track { None } else { path };
+        pipeline::download_spotify_track(&s.agent, &track, &dir, path.as_deref(), output, &on_progress, flag)
     });
     match result {
         Ok((path, m)) => {
@@ -391,7 +456,7 @@ pub unsafe extern "C" fn rs_spotify_download(
         }
         Err(e) if e.downcast_ref::<Cancelled>().is_some() => RS_CANCELLED,
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             RS_ERROR
         }
     }

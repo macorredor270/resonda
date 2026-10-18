@@ -1,7 +1,7 @@
 //! Audio AAC de un M4A: lectura fotograma a fotograma y extracción a AAC crudo (ADTS).
 
 use super::boxes::*;
-use super::track::{read_track, Track};
+use super::track::{read_track, Handler, Track};
 use crate::io::read_exact_at;
 use crate::Res;
 use std::fs::File;
@@ -60,6 +60,10 @@ pub struct AacStream {
     /// AudioSpecificConfig (los 2+ bytes de configuración del códec)
     pub asc: Vec<u8>,
     pub object_type: u8,
+    /// HE-AAC (SBR/PS): `sample_rate`, `freq_index` y `channels` son los del núcleo AAC-LC, la mitad
+    /// de la frecuencia real. Los reproductores recuperan el resto; el decodificador de la
+    /// aplicación no sabe de SBR y solo da el núcleo.
+    pub he_aac: bool,
     pub freq_index: u8,
     pub channels: u8,
     pub sample_rate: u32,
@@ -69,7 +73,7 @@ pub struct AacStream {
 
 impl AacStream {
     pub fn open(input: &Path) -> Res<AacStream> {
-        let track = read_track(input)?;
+        let track = read_track(input, Handler::Audio)?;
         if &track.fourcc != b"mp4a" {
             return Err("La pista de audio no es AAC".into());
         }
@@ -83,16 +87,24 @@ impl AacStream {
         if asc.len() < 2 {
             return Err("AudioSpecificConfig demasiado corto".into());
         }
-        let object_type = asc[0] >> 3;
+        let mut object_type = asc[0] >> 3;
+        // 5 = HE-AAC (SBR), 29 = HE-AACv2 (SBR + estéreo paramétrico): el núcleo es AAC-LC
+        let he_aac = matches!(object_type, 5 | 29);
         let freq_index = ((asc[0] & 7) << 1) | (asc[1] >> 7);
         let channels = (asc[1] >> 3) & 0x0f;
-        if !(1..=4).contains(&object_type) || freq_index as usize >= ADTS_RATES.len() || channels == 0 || channels > 7 {
+        if !he_aac && !(1..=4).contains(&object_type) || freq_index as usize >= ADTS_RATES.len() || channels == 0 || channels > 7 {
             return Err(format!("Perfil AAC no soportado (tipo {object_type}, {channels} canales)").into());
+        }
+        let mut asc = asc;
+        if he_aac {
+            object_type = 2;
+            asc = vec![(2 << 3) | (freq_index >> 1), ((freq_index & 1) << 7) | (channels << 3)];
         }
         Ok(AacStream {
             sample_rate: ADTS_RATES[freq_index as usize],
             asc,
             object_type,
+            he_aac,
             freq_index,
             channels,
             path: input.to_path_buf(),

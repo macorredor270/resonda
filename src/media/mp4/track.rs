@@ -1,4 +1,5 @@
-//! Análisis de una pista de un MP4 fragmentado (moov + moof/mdat, como los que sirve YouTube).
+//! Análisis de una pista de un MP4: fragmentado (moov + moof/mdat, como sirve YouTube) o normal
+//! (tablas stbl completas en el moov, como sirven TikTok y la mayoría de las redes).
 
 use super::boxes::*;
 use crate::Res;
@@ -52,11 +53,18 @@ pub(super) struct Trex {
     pub(super) flags: u32,
 }
 
-pub(super) fn read_track(path: &Path) -> Res<Track> {
+/// Tipo de pista a leer. `Any` toma la primera (los MP4 de YouTube traen una sola).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Handler {
+    Any,
+    Audio,
+}
+
+pub(super) fn read_track(path: &Path, handler: Handler) -> Res<Track> {
     let file = File::open(path)?;
     let (moov, moofs) = scan_file(&file, file.metadata()?.len())?;
     let top = top_of(&moov);
-    let trak = find(&moov, &top, b"trak")?;
+    let trak = pick_trak(&moov, &top, handler)?;
     let mdia = find(&moov, &trak, b"mdia")?;
     let mdhd = find(&moov, &mdia, b"mdhd")?;
     let stbl = find(&moov, &find(&moov, &mdia, b"minf")?, b"stbl")?;
@@ -92,9 +100,13 @@ pub(super) fn read_track(path: &Path) -> Res<Track> {
         chunks: Vec::new(),
         duration: 0,
     };
-    let mut dts = 0u64;
-    for (start, buf) in &moofs {
-        parse_moof(*start, buf, &trex, &mut track, &mut dts)?;
+    if moofs.is_empty() {
+        parse_stbl(&mut track, &stbl)?;
+    } else {
+        let mut dts = 0u64;
+        for (start, buf) in &moofs {
+            parse_moof(*start, buf, &trex, &mut track, &mut dts)?;
+        }
     }
     if track.samples.is_empty() {
         return Err(format!("No hay muestras en {}", path.display()).into());
@@ -105,6 +117,121 @@ pub(super) fn read_track(path: &Path) -> Res<Track> {
     }
     track.duration = track.samples.iter().map(|s| s.dur as u64).sum();
     Ok(track)
+}
+
+fn pick_trak(moov: &[u8], top: &BoxNode, handler: Handler) -> Res<BoxNode> {
+    for trak in children(moov, top.body, top.end)?.into_iter().filter(|c| &c.typ == b"trak") {
+        if handler == Handler::Any {
+            return Ok(trak);
+        }
+        let hdlr = find(moov, &find(moov, &trak, b"mdia")?, b"hdlr")?;
+        if rd(moov, hdlr.body + 8, 4)? == b"soun" {
+            return Ok(trak);
+        }
+    }
+    Err("El MP4 no tiene pista de audio".into())
+}
+
+/// Lee la lista de entradas de una caja de tabla (stts, stsc...) sin reservar memoria por
+/// adelantado: el número de entradas viene del archivo y no es de fiar.
+fn table(b: &[u8], node: &BoxNode, entry: usize, header: usize) -> Res<(usize, usize)> {
+    let count = u32_at(b, node.body + header)? as usize;
+    let start = node.body + header + 4;
+    rd(b, start, count.checked_mul(entry).ok_or("MP4 corrupto: tabla enorme")?)?;
+    Ok((count, start))
+}
+
+/// Pista de un MP4 normal: las tablas de muestras (stsz, stts, stsc, stco...) están en el moov.
+fn parse_stbl(track: &mut Track, stbl: &BoxNode) -> Res<()> {
+    let b = &track.moov;
+    let opt = |typ: &[u8; 4]| children(b, stbl.body, stbl.end).map(|k| k.into_iter().find(|c| &c.typ == typ));
+
+    let stsz = find(b, stbl, b"stsz")?;
+    let fixed = u32_at(b, stsz.body + 4)?;
+    let n = u32_at(b, stsz.body + 8)? as usize;
+    if n == 0 || n > (MAX_SAMPLES_PER_RUN as usize) * 4 {
+        return Err("MP4 corrupto: número de muestras absurdo".into());
+    }
+    let mut samples = Vec::with_capacity(n.min(1 << 20));
+    for i in 0..n {
+        let size = if fixed != 0 { fixed } else { u32_at(b, stsz.body + 12 + i * 4)? };
+        samples.push(Sample { dur: 0, size, cto: 0, sync: true });
+    }
+
+    // Duraciones (stts), comprimidas en tramos
+    let stts = find(b, stbl, b"stts")?;
+    let (runs, at) = table(b, &stts, 8, 4)?;
+    let mut i = 0usize;
+    for r in 0..runs {
+        let (count, delta) = (u32_at(b, at + r * 8)? as usize, u32_at(b, at + r * 8 + 4)?);
+        for s in samples.iter_mut().skip(i).take(count) {
+            s.dur = delta;
+        }
+        i = i.saturating_add(count);
+    }
+
+    // Desfase de composición (fotogramas B)
+    if let Some(ctts) = opt(b"ctts")? {
+        let (runs, at) = table(b, &ctts, 8, 4)?;
+        let mut i = 0usize;
+        for r in 0..runs {
+            let (count, off) = (u32_at(b, at + r * 8)? as usize, i32_at(b, at + r * 8 + 4)?);
+            for s in samples.iter_mut().skip(i).take(count) {
+                s.cto = off;
+            }
+            i = i.saturating_add(count);
+        }
+    }
+
+    // Fotogramas clave: si no hay stss, todos lo son
+    if let Some(stss) = opt(b"stss")? {
+        let (count, at) = table(b, &stss, 4, 4)?;
+        samples.iter_mut().for_each(|s| s.sync = false);
+        for k in 0..count {
+            let num = u32_at(b, at + k * 4)? as usize;
+            if let Some(s) = num.checked_sub(1).and_then(|i| samples.get_mut(i)) {
+                s.sync = true;
+            }
+        }
+    }
+
+    // Reparto de muestras en chunks (stsc) y posición de cada chunk (stco / co64)
+    let stsc = find(b, stbl, b"stsc")?;
+    let (groups, gat) = table(b, &stsc, 12, 4)?;
+    let (offsets, wide) = match opt(b"stco")? {
+        Some(n) => (n, false),
+        None => (find(b, stbl, b"co64")?, true),
+    };
+    let (nchunks, oat) = table(b, &offsets, if wide { 8 } else { 4 }, 4)?;
+    let (mut idx, mut dts) = (0usize, 0u64);
+    let mut chunks = Vec::with_capacity(nchunks.min(1 << 20));
+    for c in 0..nchunks {
+        // Último grupo cuyo primer chunk (base 1) es <= c + 1
+        let mut per = 0usize;
+        for g in 0..groups {
+            if u32_at(b, gat + g * 12)? as usize <= c + 1 {
+                per = u32_at(b, gat + g * 12 + 4)? as usize;
+            }
+        }
+        let src = if wide { u64_at(b, oat + c * 8)? } else { u32_at(b, oat + c * 4)? as u64 };
+        let part = samples.get(idx..idx.saturating_add(per)).ok_or("MP4 corrupto: tablas de muestras incoherentes")?;
+        chunks.push(Chunk {
+            src,
+            len: part.iter().map(|s| s.size as u64).sum(),
+            count: per as u32,
+            time: dts as f64 / track.timescale as f64,
+            rel: 0,
+            out: 0,
+        });
+        dts += part.iter().map(|s| s.dur as u64).sum::<u64>();
+        idx += per;
+    }
+    if idx != samples.len() {
+        return Err("MP4 corrupto: las tablas de muestras no cuadran".into());
+    }
+    track.samples = samples;
+    track.chunks = chunks;
+    Ok(())
 }
 
 pub(super) fn parse_moof(moof_start: u64, buf: &[u8], trex: &Trex, track: &mut Track, dts: &mut u64) -> Res<()> {

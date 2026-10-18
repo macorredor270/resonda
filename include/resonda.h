@@ -44,6 +44,11 @@ typedef void (*RsProgressCb)(int stage, uint64_t done, uint64_t total, void *use
 /* Toda cadena `char*` devuelta en un parámetro de salida se libera con rs_string_free. */
 void rs_string_free(char *s);
 
+/* Servicio al que pertenece un enlace o ID: identificador ("youtube", "tiktok"...) o nombre para
+ * mostrar. NULL si no se reconoce. Cadenas estáticas: no se liberan. */
+const char *rs_service_id_of(const char *input);
+const char *rs_service_name_of(const char *input);
+
 /* Consulta un vídeo (URL o ID). Devuelve NULL si falla y deja el motivo en *err. */
 RsInfo *rs_info_fetch(const char *input, char **err);
 void rs_info_free(RsInfo *info);
@@ -51,6 +56,8 @@ void rs_info_free(RsInfo *info);
 /* Los punteros devueltos son propiedad de `info` (válidos hasta rs_info_free). */
 const char *rs_info_title(const RsInfo *info);
 const char *rs_info_id(const RsInfo *info);
+const char *rs_info_service(const RsInfo *info); /* "youtube", "tiktok"... */
+const char *rs_info_cover(const RsInfo *info);   /* URL de la miniatura; puede ser "" */
 uint64_t rs_info_seconds(const RsInfo *info);
 
 /* Rellena `out` (capacidad `cap`) con las alturas disponibles, de mayor a menor.

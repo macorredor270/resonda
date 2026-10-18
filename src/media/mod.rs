@@ -1,6 +1,7 @@
 //! Formatos de salida: MP4/M4A/AAC (muxer propio), WAV, FLAC (codificador propio) y MP3.
 //! `pcm` decodifica el AAC de YouTube y alimenta a WAV, FLAC y MP3.
 
+pub mod container;
 pub mod flac;
 pub mod mp3;
 pub mod mp4;

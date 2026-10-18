@@ -1,4 +1,4 @@
-# Pruebas del núcleo en cada cambio.
+# Pruebas del núcleo en cada cambio, en los tres sistemas.
 name: CI
 
 on:
@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -16,4 +16,23 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --release --all-targets -- -D warnings
-      - run: cargo test --release
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux x86_64 y ARM, Windows y macOS (Apple Silicon)
+        os: [ubuntu-22.04, ubuntu-24.04-arm, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # PowerShell en Windows: en el bash de Git, link.exe es el de las utilidades de Git
+      - name: Tests
+        shell: pwsh
+        run: cargo test --release
+      - name: Compilar la terminal
+        shell: pwsh
+        run: cargo build --release
