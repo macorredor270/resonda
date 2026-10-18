@@ -9,7 +9,8 @@
 
 use crate::pipeline::{self, Output, Stage, Target};
 use crate::sources::spotify::{self, Collection};
-use crate::sources::youtube::{self, Kind, VideoInfo};
+use crate::sources::youtube::{Kind, VideoInfo};
+use crate::sources::{self, EXTRACTORS};
 use crate::{new_agent, Cancelled, Res};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -45,6 +46,8 @@ pub struct RsInfo {
     info: VideoInfo,
     title: CString,
     id: CString,
+    service: CString,
+    cover: CString,
 }
 
 pub struct RsCancel(AtomicBool);
@@ -94,6 +97,34 @@ pub unsafe extern "C" fn rs_string_free(s: *mut c_char) {
     }
 }
 
+/// Nombres de los servicios como cadenas C, en el orden de `EXTRACTORS`.
+fn service_names() -> &'static [(CString, CString)] {
+    static NAMES: std::sync::OnceLock<Vec<(CString, CString)>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| EXTRACTORS.iter().map(|e| (to_c(e.id()), to_c(e.name()))).collect())
+}
+
+/// Servicio al que pertenece un enlace o ID: devuelve su identificador ("youtube", "tiktok"...) o
+/// NULL si no se reconoce. La cadena es estática: no se libera.
+#[no_mangle]
+pub unsafe extern "C" fn rs_service_id_of(input: *const c_char) -> *const c_char {
+    service_of(input).map_or(std::ptr::null(), |(id, _)| id.as_ptr())
+}
+
+/// Igual que `rs_service_id_of`, pero con el nombre para mostrar ("YouTube", "TikTok"...).
+#[no_mangle]
+pub unsafe extern "C" fn rs_service_name_of(input: *const c_char) -> *const c_char {
+    service_of(input).map_or(std::ptr::null(), |(_, name)| name.as_ptr())
+}
+
+unsafe fn service_of(input: *const c_char) -> Option<&'static (CString, CString)> {
+    if input.is_null() {
+        return None;
+    }
+    let input = CStr::from_ptr(input).to_str().ok()?.trim();
+    let found = sources::find(input)?;
+    EXTRACTORS.iter().position(|e| e.id() == found.id()).and_then(|i| service_names().get(i))
+}
+
 /// Consulta un vídeo (URL o ID). Devuelve NULL si falla y deja el motivo en `*err`.
 #[no_mangle]
 pub unsafe extern "C" fn rs_info_fetch(input: *const c_char, err: *mut *mut c_char) -> *mut RsInfo {
@@ -103,8 +134,13 @@ pub unsafe extern "C" fn rs_info_fetch(input: *const c_char, err: *mut *mut c_ch
         }
         let input = CStr::from_ptr(input).to_str().map_err(|_| "La URL no es UTF-8 válido")?;
         let agent = new_agent();
-        let info = youtube::get_video_info(&agent, input.trim())?;
-        Ok(Box::new(RsInfo { agent, title: to_c(&info.title), id: to_c(&info.id), info }))
+        let info = sources::fetch_info(&agent, input.trim())?;
+        let cover = match (info.service, &info.cover_url) {
+            (_, Some(url)) => url.clone(),
+            ("youtube", None) => format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", info.id),
+            _ => String::new(),
+        };
+        Ok(Box::new(RsInfo { agent, title: to_c(&info.title), id: to_c(&info.id), service: to_c(info.service), cover: to_c(&cover), info }))
     });
     match result {
         Ok(b) => Box::into_raw(b),
@@ -128,7 +164,19 @@ pub unsafe extern "C" fn rs_info_title(info: *const RsInfo) -> *const c_char {
     info.as_ref().map_or(std::ptr::null(), |i| i.title.as_ptr())
 }
 
-/// ID de 11 caracteres (propiedad de `info`).
+/// Identificador del servicio de origen: "youtube", "tiktok"... (propiedad de `info`).
+#[no_mangle]
+pub unsafe extern "C" fn rs_info_service(info: *const RsInfo) -> *const c_char {
+    info.as_ref().map_or(std::ptr::null(), |i| i.service.as_ptr())
+}
+
+/// URL de la miniatura o portada; puede ser "" (propiedad de `info`).
+#[no_mangle]
+pub unsafe extern "C" fn rs_info_cover(info: *const RsInfo) -> *const c_char {
+    info.as_ref().map_or(std::ptr::null(), |i| i.cover.as_ptr())
+}
+
+/// ID del vídeo en su servicio (propiedad de `info`).
 #[no_mangle]
 pub unsafe extern "C" fn rs_info_id(info: *const RsInfo) -> *const c_char {
     info.as_ref().map_or(std::ptr::null(), |i| i.id.as_ptr())
@@ -148,7 +196,7 @@ pub unsafe extern "C" fn rs_info_heights(info: *const RsInfo, out: *mut u32, cap
         .info
         .formats
         .iter()
-        .filter(|f| f.kind == Kind::Video && (f.codec == "avc1" || f.codec == "av01"))
+        .filter(|f| (f.kind == Kind::Video && (f.codec == "avc1" || f.codec == "av01")) || (f.kind == Kind::Muxed && f.codec == "avc1"))
         .map(|f| f.height)
         .collect();
     heights.sort_unstable_by(|a, b| b.cmp(a));
@@ -233,7 +281,8 @@ pub unsafe extern "C" fn rs_download(
 
         let never = AtomicBool::new(false);
         let flag = cancel.as_ref().map_or(&never, |c| &c.0);
-        pipeline::execute(&info.agent, &info.info, &plan, &out, Target { output, tags: None }, &on_progress, flag)?;
+        let tags = audio_only.then(|| pipeline::info_tags(&info.agent, &info.info));
+        pipeline::execute(&info.agent, &info.info, &plan, &out, Target { output, tags: tags.as_ref() }, &on_progress, flag)?;
         Ok(out)
     });
 

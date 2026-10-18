@@ -9,14 +9,15 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use resonda::pipeline::{self, Output, Plan, Stage, Target};
 use resonda::sources::spotify::{self, Kind as SpotKind};
-use resonda::sources::youtube::{self, Kind, VideoInfo};
+use resonda::sources::youtube::{Kind, VideoInfo};
+use resonda::sources::{self, EXTRACTORS};
 use resonda::{new_agent, Res};
 
 const HELP: &str = "Uso: resonda [opciones] <URL o ID> [<URL o ID> ...]
 
-Acepta enlaces de YouTube y de Spotify (canción, álbum o playlist). De Spotify solo se leen los
-datos (título, artista, portada); el audio se busca y se descarga desde YouTube como .m4a con
-sus etiquetas.
+Acepta enlaces de YouTube, TikTok y Spotify (canción, álbum o playlist); -S los lista. De Spotify
+solo se leen los datos (título, artista, portada); el audio se busca y se descarga desde YouTube
+como .m4a con sus etiquetas.
 
 Opciones:
   -q, --quality <alto>   Altura máxima en píxeles, o \"best\" (por defecto 1080).
@@ -28,6 +29,8 @@ Opciones:
   -a, --audio            Atajo de --format m4a
   -n, --limit <N>        Con álbumes/playlists: descargar solo las N primeras canciones
   -l, --list             Mostrar los formatos disponibles (o las canciones) y salir
+  -S, --services         Mostrar los servicios soportados y salir
+  -V, --version          Mostrar la versión
   -h, --help             Esta ayuda";
 
 struct Options {
@@ -64,10 +67,24 @@ fn parse_args() -> Res<Option<Options>> {
             "-n" | "--limit" => {
                 o.limit = Some(value("--limit")?.parse().map_err(|_| "El valor de --limit debe ser un número")?)
             }
+            "-S" | "--services" => {
+                for e in EXTRACTORS {
+                    println!("{:<10} {}", e.id(), e.name());
+                }
+                println!("spotify    Spotify (solo metadatos; el audio sale de YouTube)");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("resonda {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => return Ok(None),
             f if f.starts_with('-') && f.len() > 1 => return Err(format!("Opción desconocida: {f}").into()),
             _ => o.inputs.push(arg),
         }
+    }
+    if o.bitrate != 0 && ![128, 192, 256, 320].contains(&o.bitrate) {
+        return Err("El valor de --bitrate debe ser 128, 192, 256 o 320".into());
     }
     Ok(Some(o))
 }
@@ -144,8 +161,8 @@ fn output_of(opts: &Options) -> Res<(Output, bool)> {
 }
 
 fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
-    let info = youtube::get_video_info(agent, input)?;
-    println!("{}  [{}]  {}:{:02}", info.title, info.id, info.seconds / 60, info.seconds % 60);
+    let info = sources::fetch_info(agent, input)?;
+    println!("{}  [{}: {}]  {}:{:02}", info.title, info.service, info.id, info.seconds / 60, info.seconds % 60);
 
     if opts.list {
         print_formats(&info);
@@ -161,7 +178,11 @@ fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
     let (output, audio_only) = output_of(opts)?;
     let plan = pipeline::plan(&info, max_height, audio_only)?;
     match &plan {
-        Plan::Direct(f) => println!("  MP4 directo {}p (itag {})", f.height, f.itag),
+        Plan::Direct(f) => println!("  MP4 directo {}p {} (itag {})", f.height, f.codec, f.itag),
+        Plan::Extract(_) if matches!(output, Output::Mp3(_) | Output::Wav | Output::Flac) && pipeline::original_sound(&info).is_some() => {
+            println!("  Sonido original del vídeo (si no sirve, el audio del MP4)")
+        }
+        Plan::Extract(f) => println!("  Audio AAC del MP4 de {}p", f.height),
         Plan::Merge { video: Some(v), .. } => {
             let fps = if v.fps > 30 { v.fps.to_string() } else { String::new() };
             println!("  Vídeo {}p{fps} {}  +  audio AAC", v.height, v.codec);
@@ -176,7 +197,8 @@ fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
         Stage::Audio => audio_bar.update(done, total),
         Stage::Muxing => eprintln!("  Uniendo..."),
     };
-    pipeline::execute(agent, &info, &plan, &out, Target { output, tags: None }, &on_progress, &AtomicBool::new(false))?;
+    let tags = audio_only.then(|| pipeline::info_tags(agent, &info));
+    pipeline::execute(agent, &info, &plan, &out, Target { output, tags: tags.as_ref() }, &on_progress, &AtomicBool::new(false))?;
 
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!("Guardado: {}  ({} MB)", out.display(), mb(size));

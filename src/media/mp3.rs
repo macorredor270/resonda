@@ -86,6 +86,28 @@ pub fn id3v2(t: &Tags) -> Vec<u8> {
     out
 }
 
+/// Copia un MP3 ya codificado sin tocar el audio: le quita la etiqueta ID3v2 que traiga (si la
+/// hay) y le pone la nuestra.
+pub fn retag(input: &Path, dest: &Path, tags: Option<&Tags>) -> Res<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut src = File::open(input)?;
+    let mut head = [0u8; 10];
+    let n = src.read(&mut head)?;
+    let mut skip = 0u64;
+    if n == 10 && &head[0..3] == b"ID3" && head[6..10].iter().all(|b| b & 0x80 == 0) {
+        let size = head[6..10].iter().fold(0u64, |acc, b| (acc << 7) | u64::from(*b));
+        skip = 10 + size + if head[5] & 0x10 != 0 { 10 } else { 0 };
+    }
+    src.seek(SeekFrom::Start(skip))?;
+    let mut out = BufWriter::new(File::create(dest)?);
+    if let Some(t) = tags {
+        out.write_all(&id3v2(t))?;
+    }
+    std::io::copy(&mut src, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
 impl PcmSink for Mp3Writer {
     fn start(&mut self, f: PcmFormat) -> Res<()> {
         self.format = Some(f);
@@ -119,6 +141,22 @@ impl PcmSink for Mp3Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retag_cambia_la_etiqueta_y_conserva_el_audio() {
+        let dir = std::env::temp_dir().join(format!("resonda-retag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (i, o) = (dir.join("in.mp3"), dir.join("out.mp3"));
+        let audio = [0xffu8, 0xfb, 0x90, 0x00, 1, 2, 3, 4];
+        let old = Tags { title: "viejo".into(), ..Default::default() };
+        std::fs::write(&i, [id3v2(&old), audio.to_vec()].concat()).unwrap();
+        let new = Tags { title: "nuevo".into(), artist: "A".into(), ..Default::default() };
+        retag(&i, &o, Some(&new)).unwrap();
+        let out = std::fs::read(&o).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.ends_with(&audio));
+        assert!(out.windows(5).any(|w| w == b"nuevo") && !out.windows(5).any(|w| w == b"viejo"));
+    }
 
     #[test]
     fn etiqueta_id3_bien_formada() {

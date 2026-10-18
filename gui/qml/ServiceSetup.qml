@@ -4,13 +4,13 @@ import QtQuick.Controls.Material
 import QtQuick.Effects
 import QtQuick.Layouts
 
-// Pantalla de bienvenida: se eligen los servicios que se quieren usar. Solo YouTube y Spotify
-// funcionan hoy; el resto aparece como "Próximamente".
+// Pantalla de bienvenida: se eligen los servicios que se quieren usar. YouTube, TikTok y Spotify
+// funcionan hoy (un servicio nuevo se añade a `live`); el resto aparece como "Próximamente".
 Item {
     id: root
 
     // Servicios marcados al abrir la pantalla
-    property var initial: ["youtube", "spotify"]
+    property var initial: ["youtube", "tiktok", "spotify"]
     property bool firstRun: true
     signal accepted(var ids)
     signal cancelled()
@@ -27,6 +27,7 @@ Item {
 
     readonly property var live: [
         { id: "youtube", name: "YouTube", logo: "youtube.svg", desc: qsTr("Vídeos y audio, de cualquier duración") },
+        { id: "tiktok", name: "TikTok", logo: "tiktok.svg", desc: qsTr("Vídeos sin marca de agua y su sonido") },
         { id: "spotify", name: "Spotify", logo: "spotify.svg", desc: qsTr("Canciones, álbumes y playlists") }
     ]
     readonly property var soon: [
@@ -36,7 +37,7 @@ Item {
         // Icono a todo color (PNG) aportado aparte: el SVG de la carpeta era una reconstrucción manual
         { name: "Amazon Music", logo: "amazon-music.png" },
         { name: "Vimeo", logo: "vimeo.svg" }, { name: "Twitch", logo: "twitch.svg" },
-        { name: "TikTok", logo: "tiktok.svg" }, { name: "Instagram", logo: "instagram.svg" },
+        { name: "Instagram", logo: "instagram.svg" },
         { name: "Dailymotion", logo: "dailymotion.svg" }, { name: "Facebook", logo: "facebook.svg" },
         { name: "Reddit", logo: "reddit.svg" }, { name: "X (Twitter)", logo: "x.svg" }
     ]

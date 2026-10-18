@@ -48,9 +48,8 @@ ApplicationWindow {
         return ""
     }
     readonly property string placeholder: {
-        const names = []
-        if (backend.services.indexOf("youtube") >= 0) names.push("YouTube")
-        if (backend.services.indexOf("spotify") >= 0) names.push("Spotify")
+        const labels = { youtube: "YouTube", tiktok: "TikTok", spotify: "Spotify" }
+        const names = Object.keys(labels).filter(id => backend.services.indexOf(id) >= 0).map(id => labels[id])
         return names.length ? qsTr("Pega un enlace de %1").arg(names.join(qsTr(" o de "))) : qsTr("Activa un servicio en «Servicios»")
     }
 
@@ -331,7 +330,7 @@ ApplicationWindow {
                             }
                         }
 
-                        // ---- Resolución del vídeo (solo YouTube + MP4) ----
+                        // ---- Resolución del vídeo (solo MP4) ----
                         ColumnLayout {
                             Layout.fillWidth: true
                             visible: win.videoFormat && !backend.spotify

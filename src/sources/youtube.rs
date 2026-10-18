@@ -10,6 +10,7 @@
 //
 // Si YouTube cambia algo, lo normal es que solo haya que tocar `clients()` o `Session`.
 
+use crate::sources::download;
 use crate::Res;
 use serde_json::{json, Value};
 
@@ -68,7 +69,7 @@ fn clients() -> Vec<Client> {
     ]
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Video,
     Audio,
@@ -76,7 +77,7 @@ pub enum Kind {
     Muxed,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Format {
     pub itag: u32,
     pub url: String,
@@ -88,12 +89,38 @@ pub struct Format {
     pub size: u64,
 }
 
+#[derive(Debug)]
 pub struct VideoInfo {
+    /// Servicio de origen (`Extractor::id`)
+    pub service: &'static str,
     pub id: String,
     pub title: String,
+    /// Canal, usuario o artista, si el servicio lo da
+    pub author: Option<String>,
     pub seconds: u64,
     pub formats: Vec<Format>,
-    pub ua: &'static str,
+    /// Miniatura (para la portada de los archivos de audio)
+    pub cover_url: Option<String>,
+    /// Cabeceras HTTP que el servicio exige al descargar los formatos (User-Agent, Referer, Cookie...)
+    pub headers: Vec<(String, String)>,
+}
+
+/// YouTube como servicio.
+pub struct YouTube;
+
+impl crate::sources::Extractor for YouTube {
+    fn id(&self) -> &'static str {
+        "youtube"
+    }
+    fn name(&self) -> &'static str {
+        "YouTube"
+    }
+    fn matches(&self, input: &str) -> bool {
+        is_id(input) || ["youtube.com", "youtu.be"].iter().any(|d| crate::sources::on_domain(input, d))
+    }
+    fn extract(&self, agent: &ureq::Agent, input: &str) -> Res<VideoInfo> {
+        get_video_info(agent, input)
+    }
 }
 
 fn is_id(s: &str) -> bool {
@@ -280,11 +307,14 @@ fn try_client(agent: &ureq::Agent, client: &Client, session: &Session, id: &str)
     }
     formats.extend(list("formats", true));
     Ok(VideoInfo {
+        service: "youtube",
         id: id.to_string(),
         title: p["videoDetails"]["title"].as_str().unwrap_or(id).to_string(),
+        author: p["videoDetails"]["author"].as_str().map(str::to_string),
         seconds: p["videoDetails"]["lengthSeconds"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
         formats,
-        ua: client.ua,
+        cover_url: None,
+        headers: vec![("User-Agent".into(), client.ua.into())],
     })
 }
 
@@ -299,11 +329,7 @@ fn streams_fully(agent: &ureq::Agent, info: &VideoInfo) -> Res<bool> {
         .min_by_key(|f| f.size)
         .ok_or("No hay formatos de vídeo con tamaño conocido")?;
     let last = smallest.size - 1;
-    let resp = agent
-        .get(&smallest.url)
-        .header("User-Agent", info.ua)
-        .header("Range", format!("bytes={last}-{last}"))
-        .call()?;
+    let resp = download::get(agent, &smallest.url, &info.headers).header("Range", format!("bytes={last}-{last}")).call()?;
     match resp.status().as_u16() {
         200 | 206 => Ok(true),
         403 => Ok(false),
@@ -345,6 +371,18 @@ pub fn get_video_info(agent: &ureq::Agent, input: &str) -> Res<VideoInfo> {
         }
     }
     Err(last_error)
+}
+
+/// El MP4 completo (vídeo + audio) más grande que no pase de `max_height`; si todos pasan, el más
+/// pequeño. Prefiere H.264 (avc1) sobre HEVC aunque este último tenga más resolución.
+pub fn pick_muxed(info: &VideoInfo, max_height: u32) -> Option<Format> {
+    let all = || info.formats.iter().filter(|f| f.kind == Kind::Muxed);
+    // H.264 se reproduce en cualquier sistema; HEVC solo si no hay otra cosa
+    let h264 = all().any(|f| f.codec == "avc1");
+    let usable = |f: &&Format| !h264 || f.codec == "avc1";
+    all().filter(usable).filter(|f| f.height <= max_height).max_by_key(|f| (f.height, f.bitrate))
+        .or_else(|| all().filter(usable).min_by_key(|f| (f.height, std::cmp::Reverse(f.bitrate))))
+        .cloned()
 }
 
 /// Elige qué descargar.
@@ -472,4 +510,58 @@ pub fn search(agent: &ureq::Agent, query: &str) -> Res<Vec<SearchResult>> {
     let mut out = Vec::new();
     collect_videos(&json, &mut out);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_y_enlaces_de_youtube() {
+        let id = "dQw4w9WgXcQ";
+        for input in [
+            id,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?feature=share&v=dQw4w9WgXcQ&t=10",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ#x",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            "youtu.be/dQw4w9WgXcQ?t=5",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(parse_video_id(input).unwrap(), id, "{input}");
+        }
+        assert!(parse_video_id("https://example.com/watch?v=dQw4w9WgXcQ").is_err());
+        assert!(parse_video_id("https://www.youtube.com/watch?v=corto").is_err());
+    }
+
+    fn fmt(kind: Kind, codec: &str, height: u32, fps: u32, bitrate: u64) -> Format {
+        Format { itag: 0, url: String::new(), kind, codec: codec.into(), height, fps, bitrate, size: 1 }
+    }
+
+    fn info(formats: Vec<Format>) -> VideoInfo {
+        VideoInfo { service: "youtube", id: "x".into(), title: "t".into(), author: None, seconds: 1, formats, cover_url: None, headers: vec![] }
+    }
+
+    #[test]
+    fn elige_altura_codec_y_audio() {
+        let i = info(vec![
+            fmt(Kind::Video, "avc1", 1080, 30, 3), fmt(Kind::Video, "av01", 1080, 30, 2),
+            fmt(Kind::Video, "av01", 2160, 30, 9), fmt(Kind::Video, "avc1", 720, 30, 1),
+            fmt(Kind::Audio, "mp4a", 0, 0, 128), fmt(Kind::Audio, "mp4a", 0, 0, 256),
+        ]);
+        let (v, a) = pick_formats(&i, 1080, false).unwrap();
+        let v = v.unwrap();
+        assert_eq!((v.height, v.codec.as_str(), a.bitrate), (1080, "avc1", 256));
+        assert_eq!(pick_formats(&i, u32::MAX, false).unwrap().0.unwrap().height, 2160);
+        assert!(pick_formats(&i, 100, false).is_err());
+        assert!(pick_formats(&i, 100, true).unwrap().0.is_none());
+    }
+
+    #[test]
+    fn duraciones_de_reloj() {
+        assert_eq!(parse_clock("3:34"), Some(214));
+        assert_eq!(parse_clock("1:02:03"), Some(3723));
+        assert_eq!(parse_clock("LIVE"), None);
+    }
 }

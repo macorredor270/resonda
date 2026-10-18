@@ -26,13 +26,22 @@ use build::build_moov;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use track::{read_track, Track};
+use track::{read_track, Handler, Track};
 
 /// Une varios MP4 fragmentados (una pista cada uno) en un único MP4.
 /// Devuelve el tamaño del archivo resultante.
-pub fn mux_mp4(inputs: &[PathBuf], out_path: &Path, tags: Option<&Tags>, mut on_progress: impl FnMut(u64, u64)) -> Res<u64> {
-    let mut tracks = inputs.iter().map(|p| read_track(p)).collect::<Res<Vec<_>>>()?;
+pub fn mux_mp4(inputs: &[PathBuf], out_path: &Path, tags: Option<&Tags>, on_progress: impl FnMut(u64, u64)) -> Res<u64> {
+    let tracks = inputs.iter().map(|p| read_track(p, Handler::Any)).collect::<Res<Vec<_>>>()?;
+    write_mp4(tracks, out_path, tags, on_progress)
+}
 
+/// Saca la pista de audio de un MP4 con vídeo y audio (o normal o fragmentado) y la guarda como
+/// M4A, sin recodificar.
+pub fn extract_audio_m4a(input: &Path, out_path: &Path, tags: Option<&Tags>) -> Res<u64> {
+    write_mp4(vec![read_track(input, Handler::Audio)?], out_path, tags, |_, _| {})
+}
+
+fn write_mp4(mut tracks: Vec<Track>, out_path: &Path, tags: Option<&Tags>, mut on_progress: impl FnMut(u64, u64)) -> Res<u64> {
     // Intercala los fragmentos de todas las pistas por tiempo
     let mut entries: Vec<(usize, usize)> =
         tracks.iter().enumerate().flat_map(|(ti, t)| (0..t.chunks.len()).map(move |ci| (ti, ci))).collect();

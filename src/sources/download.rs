@@ -15,16 +15,20 @@ const CHUNK: u64 = 8 * 1024 * 1024;
 const RETRIES: u32 = 4;
 const CONCURRENCY: usize = 4;
 
-fn fetch_range(agent: &ureq::Agent, url: &str, ua: &str, start: u64, end: u64) -> Res<Vec<u8>> {
+/// Cabeceras HTTP que acompañan a cada petición de descarga (User-Agent, Referer, Cookie...).
+pub type Headers = [(String, String)];
+
+/// Petición GET con las cabeceras del servicio.
+pub fn get(agent: &ureq::Agent, url: &str, headers: &Headers) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    headers.iter().fold(agent.get(url), |req, (k, v)| req.header(k, v))
+}
+
+fn fetch_range(agent: &ureq::Agent, url: &str, headers: &Headers, start: u64, end: u64) -> Res<Vec<u8>> {
     let want = (end - start + 1) as usize;
     let mut last = String::new();
     for attempt in 1..=RETRIES {
         let result = || -> Res<Vec<u8>> {
-            let resp = agent
-                .get(url)
-                .header("User-Agent", ua)
-                .header("Range", format!("bytes={start}-{end}"))
-                .call()?;
+            let resp = get(agent, url, headers).header("Range", format!("bytes={start}-{end}")).call()?;
             let code = resp.status().as_u16();
             if code != 206 && code != 200 {
                 return Err(format!("HTTP {code}").into());
@@ -55,8 +59,8 @@ fn fetch_range(agent: &ureq::Agent, url: &str, ua: &str, start: u64, end: u64) -
 }
 
 // Algunos formatos no traen contentLength: se saca de Content-Range pidiendo un solo byte
-fn probe_size(agent: &ureq::Agent, url: &str, ua: &str) -> Res<u64> {
-    let resp = agent.get(url).header("User-Agent", ua).header("Range", "bytes=0-0").call()?;
+fn probe_size(agent: &ureq::Agent, url: &str, headers: &Headers) -> Res<u64> {
+    let resp = get(agent, url, headers).header("Range", "bytes=0-0").call()?;
     resp.headers()
         .get("content-range")
         .and_then(|v| v.to_str().ok())
@@ -72,11 +76,11 @@ pub fn download_file(
     url: &str,
     dest: &Path,
     size: u64,
-    ua: &str,
+    headers: &Headers,
     on_progress: &(dyn Fn(u64, u64) + Sync),
     cancel: &AtomicBool,
 ) -> Res<()> {
-    let size = if size == 0 { probe_size(agent, url, ua)? } else { size };
+    let size = if size == 0 { probe_size(agent, url, headers)? } else { size };
     let file = File::create(dest)?;
     file.set_len(size)?;
 
@@ -99,7 +103,7 @@ pub fn download_file(
                 }
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 let Some(&(start, end)) = chunks.get(i) else { break };
-                match fetch_range(agent, url, ua, start, end) {
+                match fetch_range(agent, url, headers, start, end) {
                     Ok(buf) => {
                         if let Err(e) = write_all_at(&file, &buf, start) {
                             fail(Box::new(e));

@@ -93,9 +93,41 @@ jobs:
           name: windows
           path: Resonda-*-windows-x64.zip
 
+  # La terminal para macOS (Intel y Apple Silicon) y Linux ARM. La ventana de Qt sigue solo en
+  # Linux x86_64 y Windows.
+  cli-extra:
+    name: Terminal (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS Apple Silicon, os: macos-latest, target: macos-arm64, triple: aarch64-apple-darwin }
+          - { name: macOS Intel, os: macos-latest, target: macos-x86_64, triple: x86_64-apple-darwin }
+          - { name: Linux ARM, os: ubuntu-24.04-arm, target: linux-aarch64, triple: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.triple }}
+      - name: Empaquetar
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          OUT="resonda-cli-$VERSION-${{ matrix.target }}"
+          mkdir -p "$OUT"
+          cp target/${{ matrix.triple }}/release/resonda LICENSE README.md "$OUT/"
+          tar -czf "$OUT.tar.gz" "$OUT"
+          ls -la "$OUT.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: resonda-cli-*.tar.gz
+
   release:
     name: Publicar
-    needs: [linux, windows]
+    needs: [linux, windows, cli-extra]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -117,6 +149,8 @@ jobs:
             | Debian / Ubuntu y derivadas | `resonda_*_amd64.deb`: terminal y ventana |
             | Linux, solo terminal | `resonda-cli-*-linux-x86_64.tar.gz` |
             | Windows | `Resonda-*-windows-x64.zip` con `resonda.exe` (terminal) y `resonda-gui.exe` (ventana) |
+            | macOS (Apple Silicon / Intel) | `resonda-cli-*-macos-arm64.tar.gz` / `-macos-x86_64.tar.gz`: solo terminal |
+            | Linux ARM (Raspberry Pi 4/5, servidores) | `resonda-cli-*-linux-aarch64.tar.gz`: solo terminal |
 
             AppImage: `chmod +x Resonda-*.AppImage && ./Resonda-*.AppImage`.
             Comprueba los archivos con `SHA256SUMS.txt`. Resonda es libre (MIT) y no incluye yt-dlp ni ffmpeg.

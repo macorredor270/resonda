@@ -33,6 +33,13 @@ pub fn decode_aac_to(input: &Path, sink: &mut dyn PcmSink) -> Res<()> {
     if aac.channels > 2 {
         return Err(format!("Audio de {} canales no soportado (solo mono o estéreo)", aac.channels).into());
     }
+    if aac.he_aac {
+        eprintln!(
+            "Aviso: este audio es HE-AAC (como el de TikTok). Resonda no incluye decodificador SBR, así que WAV, FLAC y MP3 \
+             salen sin los agudos (~{} kHz máx.). M4A y AAC conservan la calidad original.",
+            aac.sample_rate / 2000
+        );
+    }
     let mut params = AudioCodecParameters::new();
     params.for_codec(CODEC_ID_AAC).with_sample_rate(aac.sample_rate).with_extra_data(aac.asc.clone().into_boxed_slice());
     let mut decoder = AacDecoder::try_new(&params, &AudioDecoderOptions::default()).map_err(|e| format!("Decodificador AAC: {e}"))?;

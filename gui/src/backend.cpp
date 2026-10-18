@@ -28,7 +28,7 @@ Backend::Backend(QObject *parent)
 {
     QSettings settings;
     m_setupDone = settings.value(QStringLiteral("setupDone"), false).toBool();
-    m_services = settings.value(QStringLiteral("services"), QStringList{QStringLiteral("youtube"), QStringLiteral("spotify")}).toStringList();
+    m_services = settings.value(QStringLiteral("services"), QStringList{QStringLiteral("youtube"), QStringLiteral("tiktok"), QStringLiteral("spotify")}).toStringList();
 }
 
 void Backend::saveServices(const QStringList &ids)
@@ -93,14 +93,17 @@ void Backend::fetchInfo(const QString &text)
         return;
     const QByteArray input = text.trimmed().toUtf8();
     if (input.isEmpty()) {
-        setError(tr("Pega la URL o el ID de un vídeo de YouTube, o un enlace de Spotify."));
+        setError(tr("Pega un enlace de YouTube, TikTok o Spotify."));
         return;
     }
     const bool isSpotify = rs_is_spotify_link(input.constData());
-    const QString service = isSpotify ? QStringLiteral("spotify") : QStringLiteral("youtube");
-    if (!m_services.contains(service)) {
+    // Un enlace que ningún servicio reconoce se deja pasar: el núcleo explica qué soporta
+    const char *id = rs_service_id_of(input.constData());
+    const QString service = isSpotify ? QStringLiteral("spotify") : (id ? QString::fromUtf8(id) : QString());
+    if (!service.isEmpty() && !m_services.contains(service)) {
+        const char *name = rs_service_name_of(input.constData());
         setError(tr("%1 está desactivado. Actívalo en «Servicios» (arriba a la derecha).")
-                     .arg(isSpotify ? QStringLiteral("Spotify") : QStringLiteral("YouTube")));
+                     .arg(isSpotify ? QStringLiteral("Spotify") : QString::fromUtf8(name)));
         return;
     }
     clearSource();
@@ -140,7 +143,7 @@ void Backend::finishFetch(RsInfo *info, const QString &error)
     m_info = info;
 
     m_title = QString::fromUtf8(rs_info_title(info));
-    m_thumbnail = QStringLiteral("https://i.ytimg.com/vi/%1/hqdefault.jpg").arg(QString::fromUtf8(rs_info_id(info)));
+    m_thumbnail = QString::fromUtf8(rs_info_cover(info));
     m_duration = clock(rs_info_seconds(info));
 
     uint32_t buf[64];
