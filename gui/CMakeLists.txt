@@ -54,6 +54,11 @@ else()
     target_link_libraries(resonda-gui PRIVATE ${CMAKE_DL_LIBS} m rt util)
 endif()
 
+# Ejecutable más pequeño: descarta el código y los datos que nadie usa (los paquetes ya van sin símbolos)
+if(NOT MSVC)
+    target_link_options(resonda-gui PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections -Wl,--as-needed -s>)
+endif()
+
 install(TARGETS resonda-gui RUNTIME DESTINATION bin)
 install(FILES data/resonda.desktop DESTINATION share/applications)
 install(FILES data/resonda.svg DESTINATION share/icons/hicolor/scalable/apps)

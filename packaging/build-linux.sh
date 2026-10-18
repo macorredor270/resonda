@@ -103,8 +103,8 @@ Architecture: amd64
 Installed-Size: $SIZE
 Depends: libc6 (>= 2.31), libgl1, libegl1
 Maintainer: Resonda contributors <noreply@github.com>
-Description: Descarga vídeos y música de YouTube y Spotify
- Resonda descarga vídeos y música de YouTube y Spotify a MP4, MP3, FLAC, WAV,
+Description: Descarga vídeos y música de YouTube, TikTok y Spotify
+ Resonda descarga vídeos y música de YouTube, TikTok y Spotify a MP4, MP3, FLAC, WAV,
  M4A o AAC. Código propio y libre (MIT): sin yt-dlp ni ffmpeg.
  Incluye la terminal (resonda) y la ventana (resonda-gui).
 CTL
