@@ -1,9 +1,9 @@
-# Pruebas del núcleo en cada cambio, en los tres sistemas.
+# Pruebas del núcleo en cada cambio de main y de debug, y en cada pull request, en Linux, Windows y macOS.
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, debug]
   pull_request:
 
 jobs:
