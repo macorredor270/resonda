@@ -2,8 +2,12 @@
 // públicas "embed", sin cuenta ni credenciales. El audio NO sale de Spotify (está protegido con
 // DRM y no se toca): cada canción se busca y se descarga desde YouTube (ver `matching`).
 
+use crate::sources::catalog::Catalog;
 use crate::Res;
 use serde_json::Value;
+
+/// User-Agent de navegador para las páginas públicas.
+pub const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -109,7 +113,7 @@ fn year_of(entity: &Value) -> Option<String> {
 pub fn fetch(agent: &ureq::Agent, kind: Kind, id: &str) -> Res<Collection> {
     let mut resp = agent
         .get(format!("https://open.spotify.com/embed/{}/{id}", kind.path()))
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .header("User-Agent", BROWSER_UA)
         .call()?;
     if !resp.status().is_success() {
         return Err(format!("Spotify respondió HTTP {}", resp.status().as_u16()).into());
@@ -175,6 +179,27 @@ pub fn refine(agent: &ureq::Agent, track: &Track) -> Track {
             }
         }
         Err(_) => track.clone(),
+    }
+}
+
+/// Spotify como catálogo.
+pub struct Spotify;
+
+impl Catalog for Spotify {
+    fn id(&self) -> &'static str {
+        "spotify"
+    }
+    fn name(&self) -> &'static str {
+        "Spotify"
+    }
+    fn parse(&self, input: &str) -> Option<(Kind, String)> {
+        parse_link(input)
+    }
+    fn fetch(&self, agent: &ureq::Agent, kind: Kind, id: &str) -> Res<Collection> {
+        fetch(agent, kind, id)
+    }
+    fn refine(&self, agent: &ureq::Agent, track: &Track) -> Track {
+        refine(agent, track)
     }
 }
 

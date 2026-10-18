@@ -10,7 +10,7 @@ Item {
     id: root
 
     // Servicios marcados al abrir la pantalla
-    property var initial: ["youtube", "tiktok", "spotify"]
+    property var initial: ["youtube", "tiktok", "bandcamp", "twitch", "spotify", "deezer", "applemusic", "tidal"]
     property bool firstRun: true
     signal accepted(var ids)
     signal cancelled()
@@ -28,15 +28,17 @@ Item {
     readonly property var live: [
         { id: "youtube", name: "YouTube", logo: "youtube.svg", desc: qsTr("Vídeos y audio, de cualquier duración") },
         { id: "tiktok", name: "TikTok", logo: "tiktok.svg", desc: qsTr("Vídeos sin marca de agua y su sonido") },
-        { id: "spotify", name: "Spotify", logo: "spotify.svg", desc: qsTr("Canciones, álbumes y playlists") }
+        { id: "twitch", name: "Twitch", logo: "twitch.svg", desc: qsTr("Clips, en todas sus calidades") },
+        { id: "bandcamp", name: "Bandcamp", logo: "bandcamp.svg", desc: qsTr("Canciones sueltas (MP3 de 128 kbps)") },
+        { id: "spotify", name: "Spotify", logo: "spotify.svg", desc: qsTr("Canciones, álbumes y playlists") },
+        { id: "deezer", name: "Deezer", logo: "deezer.svg", desc: qsTr("Canciones, álbumes y playlists") },
+        { id: "applemusic", name: "Apple Music", logo: "apple-music.svg", desc: qsTr("Canciones y álbumes") },
+        { id: "tidal", name: "Tidal", logo: "tidal.svg", desc: qsTr("Canciones sueltas") }
     ]
     readonly property var soon: [
-        { name: "Apple Music", logo: "apple-music.svg" }, { name: "SoundCloud", logo: "soundcloud.svg" },
-        { name: "Bandcamp", logo: "bandcamp.svg" }, { name: "Deezer", logo: "deezer.svg" },
-        { name: "Tidal", logo: "tidal.svg" },
+        { name: "SoundCloud", logo: "soundcloud.svg" },
         // Icono a todo color (PNG) aportado aparte: el SVG de la carpeta era una reconstrucción manual
         { name: "Amazon Music", logo: "amazon-music.png" },
-        { name: "Vimeo", logo: "vimeo.svg" }, { name: "Twitch", logo: "twitch.svg" },
         { name: "Instagram", logo: "instagram.svg" },
         { name: "Dailymotion", logo: "dailymotion.svg" }, { name: "Facebook", logo: "facebook.svg" },
         { name: "Reddit", logo: "reddit.svg" }, { name: "X (Twitter)", logo: "x.svg" }

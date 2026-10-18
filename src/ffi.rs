@@ -9,6 +9,7 @@
 
 use crate::pipeline::{self, Output, Stage, Target};
 use crate::sources::spotify::{self, Collection};
+use crate::sources::{find_catalog, Catalog};
 use crate::sources::youtube::{Kind, VideoInfo};
 use crate::sources::{self, EXTRACTORS};
 use crate::{new_agent, Cancelled, Res};
@@ -97,10 +98,13 @@ pub unsafe extern "C" fn rs_string_free(s: *mut c_char) {
     }
 }
 
-/// Nombres de los servicios como cadenas C, en el orden de `EXTRACTORS`.
+/// Nombres de los servicios (extractores y catálogos) como cadenas C.
 fn service_names() -> &'static [(CString, CString)] {
     static NAMES: std::sync::OnceLock<Vec<(CString, CString)>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| EXTRACTORS.iter().map(|e| (to_c(e.id()), to_c(e.name()))).collect())
+    NAMES.get_or_init(|| {
+        let extractors = EXTRACTORS.iter().map(|e| (to_c(e.id()), to_c(e.name())));
+        extractors.chain(crate::sources::CATALOGS.iter().map(|c| (to_c(c.id()), to_c(c.name())))).collect()
+    })
 }
 
 /// Servicio al que pertenece un enlace o ID: devuelve su identificador ("youtube", "tiktok"...) o
@@ -121,8 +125,12 @@ unsafe fn service_of(input: *const c_char) -> Option<&'static (CString, CString)
         return None;
     }
     let input = CStr::from_ptr(input).to_str().ok()?.trim();
-    let found = sources::find(input)?;
-    EXTRACTORS.iter().position(|e| e.id() == found.id()).and_then(|i| service_names().get(i))
+    let names = service_names();
+    let id = match find_catalog(input) {
+        Some((catalog, _, _)) => catalog.id(),
+        None => sources::find(input)?.id(),
+    };
+    names.iter().find(|(i, _)| i.to_bytes() == id.as_bytes())
 }
 
 /// Consulta un vídeo (URL o ID). Devuelve NULL si falla y deja el motivo en `*err`.
@@ -305,19 +313,21 @@ pub unsafe extern "C" fn rs_download(
 
 pub struct RsSpotify {
     agent: ureq::Agent,
+    catalog: &'static dyn Catalog,
     collection: Collection,
     name: CString,
     cover: CString,
     labels: Vec<CString>,
 }
 
-/// 1 si `input` es un enlace o URI de Spotify (canción, álbum o playlist).
+/// 1 si `input` es un enlace de un catálogo de música (Spotify, Deezer, Apple Music, Tidal: canción,
+/// álbum o playlist). El nombre es histórico: antes solo existía Spotify.
 #[no_mangle]
 pub unsafe extern "C" fn rs_is_spotify_link(input: *const c_char) -> c_int {
     if input.is_null() {
         return 0;
     }
-    CStr::from_ptr(input).to_str().ok().and_then(spotify::parse_link).is_some() as c_int
+    CStr::from_ptr(input).to_str().ok().and_then(find_catalog).is_some() as c_int
 }
 
 /// Lee los datos (no el audio) de un enlace de Spotify. Devuelve NULL si falla (motivo en `*err`).
@@ -328,12 +338,12 @@ pub unsafe extern "C" fn rs_spotify_fetch(input: *const c_char, err: *mut *mut c
             return Err("Enlace vacío".into());
         }
         let text = CStr::from_ptr(input).to_str().map_err(|_| "El enlace no es UTF-8 válido")?;
-        let (kind, id) = spotify::parse_link(text).ok_or("No es un enlace de Spotify válido")?;
+        let (catalog, kind, id) = find_catalog(text).ok_or("No es un enlace de un catálogo de música soportado")?;
         let agent = new_agent();
-        let collection = spotify::fetch(&agent, kind, &id)?;
+        let collection = catalog.fetch(&agent, kind, &id)?;
         let cover = collection.tracks.first().and_then(|t| t.cover_url.clone()).unwrap_or_default();
         let labels = collection.tracks.iter().map(|t| to_c(&t.label())).collect();
-        Ok(Box::new(RsSpotify { agent, name: to_c(&collection.name), cover: to_c(&cover), labels, collection }))
+        Ok(Box::new(RsSpotify { agent, catalog, name: to_c(&collection.name), cover: to_c(&cover), labels, collection }))
     });
     match result {
         Ok(b) => Box::into_raw(b),
@@ -417,7 +427,7 @@ pub unsafe extern "C" fn rs_spotify_download(
         };
         // Spotify es solo música: el vídeo MP4 se sustituye por M4A
         let (output, _) = output_of(if format == RS_FORMAT_MP4 { RS_FORMAT_M4A } else { format }, bitrate_kbps)?;
-        let track = if s.collection.kind == spotify::Kind::Track { track.clone() } else { spotify::refine(&s.agent, track) };
+        let track = if s.collection.kind == spotify::Kind::Track { track.clone() } else { s.catalog.refine(&s.agent, track) };
         let user = &user;
         let on_progress = move |stage: Stage, done: u64, total: u64| {
             if let Some(cb) = progress {

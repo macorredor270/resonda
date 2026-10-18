@@ -4,12 +4,19 @@
 //! Para añadir una red nueva: crea `sources/<red>.rs` con un tipo que implemente [`Extractor`]
 //! y añádelo a [`EXTRACTORS`]. El resto (CLI, ventana, formatos de salida) funciona sin tocarlo.
 
+pub mod apple;
+pub mod bandcamp;
+pub mod catalog;
+pub mod deezer;
 pub mod download;
 pub mod matching;
 pub mod spotify;
+pub mod tidal;
 pub mod tiktok;
+pub mod twitch;
 pub mod youtube;
 
+pub use catalog::{find_catalog, Catalog, CATALOGS};
 use crate::sources::youtube::VideoInfo;
 use crate::Res;
 
@@ -26,7 +33,7 @@ pub trait Extractor: Sync {
 }
 
 /// Servicios soportados, por orden de prueba.
-pub static EXTRACTORS: &[&dyn Extractor] = &[&tiktok::TikTok, &youtube::YouTube];
+pub static EXTRACTORS: &[&dyn Extractor] = &[&tiktok::TikTok, &bandcamp::Bandcamp, &twitch::Twitch, &youtube::YouTube];
 
 /// El extractor que reconoce `input`, si hay alguno.
 pub fn find(input: &str) -> Option<&'static dyn Extractor> {
@@ -58,6 +65,53 @@ pub fn on_domain(input: &str, domain: &str) -> bool {
     host_of(input).is_some_and(|h| h == domain || h.ends_with(&format!(".{domain}")))
 }
 
+/// Codifica un valor para una URL (`%XX` para todo menos letras, cifras y `-_.~`).
+pub fn percent_encode(s: &str) -> String {
+    s.bytes().fold(String::with_capacity(s.len() * 2), |mut out, b| {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+        out
+    })
+}
+
+/// Deshace los escapes HTML más comunes (`&quot;`, `&amp;`, `&#39;`, `&#x27;`...).
+pub fn html_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').filter(|&end| end <= 10).and_then(|end| {
+            let ch = match &rest[1..end] {
+                "quot" => '"',
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "apos" => '\'',
+                e if e.starts_with("#x") => char::from_u32(u32::from_str_radix(&e[2..], 16).ok()?)?,
+                e if e.starts_with('#') => char::from_u32(e[1..].parse().ok()?)?,
+                _ => return None,
+            };
+            Some((ch, end + 1))
+        });
+        match decoded {
+            Some((ch, len)) => {
+                out.push(ch);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Cookies que un servicio reparte a cualquier visitante, listas para la cabecera `Cookie`.
 pub fn cookie_header(headers: &ureq::http::HeaderMap) -> String {
     let mut jar: Vec<(String, String)> = Vec::new();
@@ -86,7 +140,20 @@ mod tests {
     }
 
     #[test]
+    fn codifica_urls() {
+        assert_eq!(percent_encode("a b/ñ{\"x\":1}"), "a%20b%2F%C3%B1%7B%22x%22%3A1%7D");
+    }
+
+    #[test]
+    fn escapes_html() {
+        assert_eq!(html_unescape("a &quot;b&quot; &amp; c &#39;d&#x27; &lt;e&gt; & f &nada; &#xZZ;"), "a \"b\" & c 'd' <e> & f &nada; &#xZZ;");
+        assert_eq!(html_unescape("sin escapes"), "sin escapes");
+    }
+
+    #[test]
     fn cada_enlace_va_a_su_servicio() {
+        assert_eq!(find("https://clips.twitch.tv/AbCd-123").map(|e| e.id()), Some("twitch"));
+        assert_eq!(find("https://banditcamp.bandcamp.com/track/track-i").map(|e| e.id()), Some("bandcamp"));
         let id = |s| find(s).map(|e| e.id());
         assert_eq!(id("https://www.tiktok.com/@user/video/7106594312292453675"), Some("tiktok"));
         assert_eq!(id("https://vt.tiktok.com/ZSabc123/"), Some("tiktok"));

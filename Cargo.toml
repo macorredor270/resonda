@@ -21,6 +21,7 @@ serde_json = "1"
 symphonia-codec-aac = { version = "0.6.1", default-features = false }
 symphonia-core = { version = "0.6.1", default-features = false }
 rusty_mp3 = { version = "0.8", default-features = false }
+symphonia-bundle-mp3 = { version = "0.6.1", default-features = false, features = ["mp3"] }
 
 [profile.release]
 opt-level = "s"

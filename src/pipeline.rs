@@ -8,6 +8,7 @@ use crate::sources::spotify::Track;
 use crate::media::flac::FlacWriter;
 use crate::media::mp3::{self, Mp3Writer};
 use crate::media::wav::WavWriter;
+use crate::media::container::{sniff, Container};
 use crate::media::{mp4, pcm};
 use crate::sources::matching;
 use crate::{Cancelled, Res};
@@ -87,6 +88,15 @@ impl Plan {
 }
 
 pub fn plan(info: &VideoInfo, max_height: u32, audio_only: bool) -> Res<Plan> {
+    // Servicios de solo audio (Bandcamp...): el archivo de audio ya hecho es lo único que hay
+    let has_video = info.formats.iter().any(|f| matches!(f.kind, Kind::Video | Kind::Muxed));
+    if !has_video {
+        let sound = original_sound(info).ok_or("No hay formatos descargables")?;
+        if !audio_only {
+            return Err(format!("{} solo tiene audio: elige MP3, FLAC o WAV", info.service).into());
+        }
+        return Ok(Plan::Extract(sound.clone()));
+    }
     // Servicios que solo dan MP4 completos (TikTok...), y vídeos de YouTube pequeños: sin muxer
     let split = info.formats.iter().any(|f| f.kind == Kind::Video) && info.formats.iter().any(|f| f.kind == Kind::Audio);
     let small = !audio_only && max_height <= 360;
@@ -155,26 +165,6 @@ pub fn original_sound(info: &VideoInfo) -> Option<&Format> {
     info.formats.iter().find(|f| f.kind == Kind::Audio && f.codec == "sound")
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Container {
-    Mp3,
-    Mp4,
-    Unknown,
-}
-
-/// Qué es de verdad un archivo de audio, según sus primeros bytes (las extensiones y los tipos
-/// MIME de los servicios no son de fiar).
-fn sniff(path: &Path) -> Container {
-    use std::io::Read;
-    let mut head = [0u8; 12];
-    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
-    match &head[..n] {
-        h if h.starts_with(b"ID3") || (h.len() > 2 && h[0] == 0xff && h[1] & 0xe0 == 0xe0) => Container::Mp3,
-        h if h.len() >= 8 && &h[4..8] == b"ftyp" => Container::Mp4,
-        _ => Container::Unknown,
-    }
-}
-
 /// Saca el audio de un plan `Extract`. Si el servicio da el sonido original suelto y sirve para el
 /// formato pedido, se usa ese (calidad completa); si no, se baja el MP4 y se saca su audio.
 #[allow(clippy::too_many_arguments)]
@@ -198,7 +188,7 @@ fn extract_audio(
             Ok(()) => {
                 on_progress(Stage::Muxing, 0, 0);
                 match sniff(part) {
-                    Container::Mp3 if matches!(output, Output::Mp3(_)) => return mp3::retag(part, tmp, tags),
+                    Container::Mp3 if matches!(output, Output::Mp3(_) | Output::Wav | Output::Flac) => return write_audio(output, part, tmp, tags),
                     Container::Mp4 if mp4::AacStream::open(part).is_ok_and(|a| !a.he_aac) => return write_audio(output, part, tmp, tags),
                     _ => {}
                 }
@@ -216,12 +206,21 @@ fn extract_audio(
 
 /// Convierte el audio AAC de `input` (un MP4 con o sin vídeo) al formato de audio pedido.
 fn write_audio(output: Output, input: &Path, dest: &Path, tags: Option<&Tags>) -> Res<()> {
+    // Un MP3 ya es MP3: solo cambia la etiqueta. Pasarlo a AAC (M4A, AAC) exigiría recodificarlo,
+    // cosa que Resonda no hace (no tiene codificador AAC).
+    match (sniff(input), output) {
+        (Container::Mp3, Output::Mp3(_)) => return mp3::retag(input, dest, tags),
+        (Container::Mp3, Output::Mp4 | Output::Adts) => {
+            return Err("Este audio es MP3: no se puede guardar como M4A ni AAC sin recodificar. Usa MP3, FLAC o WAV".into())
+        }
+        _ => {}
+    }
     match output {
         Output::Mp4 => mp4::extract_audio_m4a(input, dest, tags).map(|_| ()),
         Output::Adts => mp4::extract_aac_adts(input, dest).map(|_| ()),
-        Output::Wav => pcm::decode_aac_to(input, &mut WavWriter::create(dest, tags)?),
-        Output::Flac => pcm::decode_aac_to(input, &mut FlacWriter::create(dest, tags)?),
-        Output::Mp3(kbps) => pcm::decode_aac_to(input, &mut Mp3Writer::create(dest, tags, kbps)?),
+        Output::Wav => pcm::decode_to(input, &mut WavWriter::create(dest, tags)?),
+        Output::Flac => pcm::decode_to(input, &mut FlacWriter::create(dest, tags)?),
+        Output::Mp3(kbps) => pcm::decode_to(input, &mut Mp3Writer::create(dest, tags, kbps)?),
     }
 }
 
@@ -405,23 +404,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod sniff_tests {
-    use super::*;
-
-    #[test]
-    fn reconoce_el_contenedor_por_los_bytes() {
-        let dir = std::env::temp_dir().join(format!("resonda-sniff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let check = |name: &str, bytes: &[u8]| {
-            let p = dir.join(name);
-            std::fs::write(&p, bytes).unwrap();
-            sniff(&p)
-        };
-        assert_eq!(check("a.mp3", b"ID3\x04\0\0\0\0\0\0"), Container::Mp3);
-        assert_eq!(check("b.mp3", &[0xff, 0xfb, 0x90, 0x00, 0, 0, 0, 0]), Container::Mp3);
-        assert_eq!(check("c.m4a", b"\0\0\0\x18ftypM4A \0\0"), Container::Mp4);
-        assert_eq!(check("d.bin", b"nada"), Container::Unknown);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}

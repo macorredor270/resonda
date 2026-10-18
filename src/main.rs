@@ -8,16 +8,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use resonda::pipeline::{self, Output, Plan, Stage, Target};
-use resonda::sources::spotify::{self, Kind as SpotKind};
+use resonda::sources::spotify::Kind as SpotKind;
 use resonda::sources::youtube::{Kind, VideoInfo};
-use resonda::sources::{self, EXTRACTORS};
+use resonda::sources::{self, Catalog, CATALOGS, EXTRACTORS};
 use resonda::{new_agent, Res};
 
 const HELP: &str = "Uso: resonda [opciones] <URL o ID> [<URL o ID> ...]
 
-Acepta enlaces de YouTube, TikTok y Spotify (canción, álbum o playlist); -S los lista. De Spotify
-solo se leen los datos (título, artista, portada); el audio se busca y se descarga desde YouTube
-como .m4a con sus etiquetas.
+Acepta enlaces de YouTube, TikTok, Bandcamp y clips de Twitch, y de Spotify, Deezer, Apple Music y
+Tidal; -S los lista. De estos cuatro últimos (canción, álbum o playlist) solo se leen los datos
+(título, artista, portada): el audio se busca y se descarga desde YouTube como .m4a con sus etiquetas.
 
 Opciones:
   -q, --quality <alto>   Altura máxima en píxeles, o \"best\" (por defecto 1080).
@@ -71,7 +71,9 @@ fn parse_args() -> Res<Option<Options>> {
                 for e in EXTRACTORS {
                     println!("{:<10} {}", e.id(), e.name());
                 }
-                println!("spotify    Spotify (solo metadatos; el audio sale de YouTube)");
+                for c in CATALOGS {
+                    println!("{:<10} {} (solo metadatos; el audio sale de YouTube)", c.id(), c.name());
+                }
                 std::process::exit(0);
             }
             "-V" | "--version" => {
@@ -169,6 +171,16 @@ fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
         return Ok(());
     }
 
+    // Servicios de solo audio (Bandcamp): sin elegir formato, MP3 en vez de un MP4 que no existe
+    let audio_service = !info.formats.iter().any(|f| matches!(f.kind, Kind::Video | Kind::Muxed));
+    let adjusted;
+    let opts = if audio_service && opts.format == "mp4" {
+        adjusted = Options { format: "mp3".into(), quality: opts.quality.clone(), output: opts.output.clone(), dir: opts.dir.clone(), inputs: vec![], ..*opts };
+        &adjusted
+    } else {
+        opts
+    };
+
     let max_height: u32 = if opts.quality == "best" {
         u32::MAX
     } else {
@@ -179,6 +191,7 @@ fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
     let plan = pipeline::plan(&info, max_height, audio_only)?;
     match &plan {
         Plan::Direct(f) => println!("  MP4 directo {}p {} (itag {})", f.height, f.codec, f.itag),
+        Plan::Extract(f) if f.codec == "sound" => println!("  Audio original del servicio"),
         Plan::Extract(_) if matches!(output, Output::Mp3(_) | Output::Wav | Output::Flac) && pipeline::original_sound(&info).is_some() => {
             println!("  Sonido original del vídeo (si no sirve, el audio del MP4)")
         }
@@ -205,8 +218,8 @@ fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
     Ok(())
 }
 
-fn spotify_one(agent: &ureq::Agent, opts: &Options, kind: SpotKind, id: &str) -> Res<()> {
-    let col = spotify::fetch(agent, kind, id)?;
+fn catalog_one(agent: &ureq::Agent, opts: &Options, catalog: &dyn Catalog, kind: SpotKind, id: &str) -> Res<()> {
+    let col = catalog.fetch(agent, kind, id)?;
     println!("{}  ({} canciones)", col.name, col.tracks.len());
     if opts.list {
         for (i, t) in col.tracks.iter().enumerate() {
@@ -216,13 +229,13 @@ fn spotify_one(agent: &ureq::Agent, opts: &Options, kind: SpotKind, id: &str) ->
         return Ok(());
     }
 
-    // Spotify es solo música: si no se pidió un formato de audio, M4A
+    // Los catálogos son solo música: si no se pidió un formato de audio, M4A
     let format = if opts.format == "mp4" { Output::Mp4 } else { output_of(opts)?.0 };
     let dir = if kind == SpotKind::Track { opts.dir.clone() } else { opts.dir.join(pipeline::safe_name(&col.name)) };
     let total = col.tracks.len().min(opts.limit.unwrap_or(usize::MAX));
     let (mut failed, cancel) = (0, AtomicBool::new(false));
     for (i, t) in col.tracks.iter().take(total).enumerate() {
-        let t = if kind == SpotKind::Track { t.clone() } else { spotify::refine(agent, t) };
+        let t = if kind == SpotKind::Track { t.clone() } else { catalog.refine(agent, t) };
         print!("[{}/{}] {} ... ", i + 1, total, t.label());
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let output = (kind == SpotKind::Track).then_some(opts.output.as_deref()).flatten();
@@ -267,8 +280,8 @@ fn main() {
 
     let mut failed = 0;
     for input in &opts.inputs {
-        let result = match spotify::parse_link(input) {
-            Some((kind, id)) => spotify_one(&agent, &opts, kind, &id),
+        let result = match sources::find_catalog(input) {
+            Some((catalog, kind, id)) => catalog_one(&agent, &opts, catalog, kind, &id),
             None => fetch_one(&agent, &opts, input),
         };
         if let Err(e) = result {

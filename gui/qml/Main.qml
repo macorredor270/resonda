@@ -39,7 +39,7 @@ ApplicationWindow {
         { value: 1, label: "M4A",  hint: qsTr("Audio AAC en MP4, sin recodificar") },
         { value: 2, label: "AAC",  hint: qsTr("Audio AAC crudo, sin recodificar") }
     ]
-    // Spotify es solo música: sin vídeo
+    // Los catálogos de música (Spotify, Deezer…) no tienen vídeo
     readonly property var formatChoices: backend.spotify ? allFormats.slice(1) : allFormats
     readonly property string formatHint: {
         for (const f of allFormats)
@@ -48,7 +48,8 @@ ApplicationWindow {
         return ""
     }
     readonly property string placeholder: {
-        const labels = { youtube: "YouTube", tiktok: "TikTok", spotify: "Spotify" }
+        const labels = { youtube: "YouTube", tiktok: "TikTok", twitch: "Twitch", bandcamp: "Bandcamp", spotify: "Spotify",
+                         deezer: "Deezer", applemusic: "Apple Music", tidal: "Tidal" }
         const names = Object.keys(labels).filter(id => backend.services.indexOf(id) >= 0).map(id => labels[id])
         return names.length ? qsTr("Pega un enlace de %1").arg(names.join(qsTr(" o de "))) : qsTr("Activa un servicio en «Servicios»")
     }
@@ -364,7 +365,7 @@ ApplicationWindow {
                         Label {
                             Layout.fillWidth: true
                             visible: backend.spotify
-                            text: qsTr("De Spotify solo se leen los datos (título, artista, portada). El audio se busca y se descarga de YouTube, y se guarda con sus etiquetas.")
+                            text: qsTr("De Spotify, Deezer, Apple Music y Tidal solo se leen los datos (título, artista, portada). El audio se busca y se descarga de YouTube, y se guarda con sus etiquetas.")
                             wrapMode: Text.Wrap
                             font.pixelSize: 12
                             opacity: 0.6
