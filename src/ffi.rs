@@ -153,7 +153,7 @@ pub unsafe extern "C" fn rs_info_fetch(input: *const c_char, err: *mut *mut c_ch
     match result {
         Ok(b) => Box::into_raw(b),
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             std::ptr::null_mut()
         }
     }
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn rs_download(
         }
         Err(e) if e.downcast_ref::<Cancelled>().is_some() => RS_CANCELLED,
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             RS_ERROR
         }
     }
@@ -348,7 +348,7 @@ pub unsafe extern "C" fn rs_spotify_fetch(input: *const c_char, err: *mut *mut c
     match result {
         Ok(b) => Box::into_raw(b),
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             std::ptr::null_mut()
         }
     }
@@ -436,7 +436,13 @@ pub unsafe extern "C" fn rs_spotify_download(
         };
         let never = AtomicBool::new(false);
         let flag = cancel.as_ref().map_or(&never, |c| &c.0);
-        pipeline::download_spotify_track(&s.agent, &track, &dir, None, output, &on_progress, flag)
+        // Si hay canciones con el mismo nombre antes que esta, se numera para no pisarlas (la ventana
+        // baja las canciones de una en una, así que el nombre sale de su posición en la lista)
+        let mut used = std::collections::HashSet::new();
+        let ext = output.extension(true);
+        let path = s.collection.tracks.iter().take(i + 1).map(|t| pipeline::unique_track_path(&dir, t, ext, &mut used)).last();
+        let path = if s.collection.kind == spotify::Kind::Track { None } else { path };
+        pipeline::download_spotify_track(&s.agent, &track, &dir, path.as_deref(), output, &on_progress, flag)
     });
     match result {
         Ok((path, m)) => {
@@ -450,7 +456,7 @@ pub unsafe extern "C" fn rs_spotify_download(
         }
         Err(e) if e.downcast_ref::<Cancelled>().is_some() => RS_CANCELLED,
         Err(e) => {
-            set_err(err, &e.to_string());
+            set_err(err, &crate::explain(&*e));
             RS_ERROR
         }
     }

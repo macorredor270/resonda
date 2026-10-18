@@ -6,7 +6,7 @@
 // Si Twitch cambia algo, lo normal es que solo haya que tocar `QUERY` o `info_from_json`.
 
 use crate::sources::youtube::{Format, Kind, VideoInfo};
-use crate::sources::{host_of, on_domain, percent_encode, Extractor};
+use crate::sources::{host_of, on_domain, percent_encode, retry_call, Extractor};
 use crate::Res;
 use serde_json::{json, Value};
 
@@ -32,11 +32,8 @@ impl Extractor for Twitch {
     }
     fn extract(&self, agent: &ureq::Agent, input: &str) -> Res<VideoInfo> {
         let slug = clip_slug(input).ok_or("Twitch: solo se pueden descargar clips (clips.twitch.tv/… o twitch.tv/canal/clip/…)")?;
-        let mut resp = agent
-            .post("https://gql.twitch.tv/gql")
-            .header("Client-ID", CLIENT_ID)
-            .header("User-Agent", UA)
-            .send_json(json!({ "query": QUERY, "variables": { "slug": slug } }))?;
+        let body = json!({ "query": QUERY, "variables": { "slug": slug } });
+        let mut resp = retry_call(|| agent.post("https://gql.twitch.tv/gql").header("Client-ID", CLIENT_ID).header("User-Agent", UA).send_json(&body))?;
         if !resp.status().is_success() {
             return Err(format!("Twitch respondió HTTP {}", resp.status().as_u16()).into());
         }
@@ -50,7 +47,7 @@ fn is_slug(s: &str) -> bool {
 
 /// El identificador (slug) de un clip: `clips.twitch.tv/<slug>`, `clips.twitch.tv/embed?clip=<slug>`,
 /// `twitch.tv/<canal>/clip/<slug>` o `m.twitch.tv/clip/<slug>`.
-fn clip_slug(input: &str) -> Option<String> {
+pub(crate) fn clip_slug(input: &str) -> Option<String> {
     let host = host_of(input)?;
     let rest = input.split_once("://").map_or(input, |(_, r)| r);
     let (path, query) = rest.split_once('/').map_or(("", ""), |(_, p)| p.split_once('?').unwrap_or((p, "")));
@@ -141,6 +138,22 @@ mod tests {
         assert_eq!(i.formats[0].url, "https://c/1080.mp4?sig=abc&token=%7B%22a%22%3A1%7D");
         let p = crate::sources::youtube::pick_muxed(&i, 720).unwrap();
         assert_eq!(p.height, 360);
+    }
+
+    #[test]
+    fn respuestas_danadas_no_hacen_panico() {
+        let json = r#"{"data":{"clip":{"id":"1","title":"Gran jugada","durationSeconds":33.4,"broadcaster":{"displayName":"Canal"},
+            "thumbnailURL":"https://x/t.jpg","playbackAccessToken":{"signature":"abc","value":"{\"a\":1}"},
+            "videoQualities":[{"quality":"1080","frameRate":60.0,"sourceURL":"https://c/1080.mp4"}]}}}"#;
+        let mut rng = crate::testutil::Rng(13);
+        for text in crate::testutil::mutations(json, &mut rng, 3000) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                let _ = info_from_json(&v);
+            }
+        }
+        for weird in [json!(null), json!([]), json!({"data":7}), json!({"data":{"clip":{"playbackAccessToken":{"signature":1,"value":2},"videoQualities":{}}}}), json!({"errors":[]}), json!({"errors":[{"message":5}]})] {
+            let _ = info_from_json(&weird);
+        }
     }
 
     #[test]

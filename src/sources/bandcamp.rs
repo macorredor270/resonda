@@ -4,7 +4,7 @@
 // Si Bandcamp cambia algo, lo normal es que solo haya que tocar `info_from_html`.
 
 use crate::sources::youtube::{Format, Kind, VideoInfo};
-use crate::sources::{html_unescape, on_domain, Extractor};
+use crate::sources::{html_unescape, on_domain, retry_call, Extractor};
 use crate::Res;
 use serde_json::Value;
 
@@ -24,7 +24,7 @@ impl Extractor for Bandcamp {
     }
     fn extract(&self, agent: &ureq::Agent, input: &str) -> Res<VideoInfo> {
         let url = if input.contains("://") { input.to_string() } else { format!("https://{input}") };
-        let mut resp = agent.get(&url).header("User-Agent", UA).call()?;
+        let mut resp = retry_call(|| agent.get(&url).header("User-Agent", UA).call())?;
         if !resp.status().is_success() {
             return Err(format!("Bandcamp respondió HTTP {}", resp.status().as_u16()).into());
         }
@@ -86,6 +86,18 @@ mod tests {
         assert_eq!(i.formats.len(), 1);
         assert_eq!(i.formats[0].url, "https://t4.bcbits.com/s.mp3?a=1&b=2");
         assert!(crate::pipeline::original_sound(&i).is_some());
+    }
+
+    #[test]
+    fn paginas_danadas_no_hacen_panico() {
+        let html = page(r#"[{"title":"Hola","duration":116.37,"file":{"mp3-128":"https://t4.bcbits.com/s.mp3?a=1&b=2"}}]"#);
+        let mut rng = crate::testutil::Rng(12);
+        for h in crate::testutil::mutations(&html, &mut rng, 3000) {
+            let _ = info_from_html(&h);
+        }
+        for weird in ["null", "[]", r#"{"trackinfo":"x"}"#, r#"{"trackinfo":[null]}"#, r#"{"trackinfo":[{"file":7,"duration":"x"}],"id":"no"}"#, r#"{"trackinfo":[{"title":5,"file":{"mp3-128":1}}]}"#] {
+            let _ = info_from_html(&format!("<div data-tralbum=\"{}\"></div>", weird.replace('"', "&quot;")));
+        }
     }
 
     #[test]

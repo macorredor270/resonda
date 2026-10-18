@@ -111,10 +111,8 @@ fn year_of(entity: &Value) -> Option<String> {
 
 /// Lee una canción, un álbum o una playlist.
 pub fn fetch(agent: &ureq::Agent, kind: Kind, id: &str) -> Res<Collection> {
-    let mut resp = agent
-        .get(format!("https://open.spotify.com/embed/{}/{id}", kind.path()))
-        .header("User-Agent", BROWSER_UA)
-        .call()?;
+    let url = format!("https://open.spotify.com/embed/{}/{id}", kind.path());
+    let mut resp = crate::sources::retry_call(|| agent.get(&url).header("User-Agent", BROWSER_UA).call())?;
     if !resp.status().is_success() {
         return Err(format!("Spotify respondió HTTP {}", resp.status().as_u16()).into());
     }

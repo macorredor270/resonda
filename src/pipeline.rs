@@ -62,6 +62,7 @@ impl Target<'_> {
     pub const MP4: Target<'static> = Target { output: Output::Mp4, tags: None };
 }
 
+#[derive(Debug)]
 pub enum Plan {
     /// MP4 ya completo (vídeo+audio) que se guarda tal cual: lo normal en TikTok, y en YouTube
     /// hasta 360p.
@@ -202,6 +203,20 @@ fn extract_audio(
     }
     on_progress(Stage::Muxing, 0, 0);
     write_audio(output, part, tmp, tags)
+}
+
+/// Ruta de una canción dentro de `dir`. Si en esta tanda ya hay otra con el mismo nombre (dos
+/// canciones con el mismo título y artista, o nombres que solo difieren en mayúsculas en un
+/// sistema que no las distingue), se le añade « (2)», « (3)»... para no pisarla.
+pub fn unique_track_path(dir: &Path, track: &Track, ext: &str, used: &mut std::collections::HashSet<String>) -> PathBuf {
+    let stem = safe_name(&track.label());
+    let mut name = format!("{stem}.{ext}");
+    let mut n = 2;
+    while !used.insert(name.to_lowercase()) {
+        name = format!("{stem} ({n}).{ext}");
+        n += 1;
+    }
+    dir.join(name)
 }
 
 /// Convierte el audio AAC de `input` (un MP4 con o sin vídeo) al formato de audio pedido.
@@ -396,6 +411,16 @@ mod tests {
     }
 
     #[test]
+    fn dos_canciones_con_el_mismo_nombre_no_se_pisan() {
+        let t = |title: &str| Track { title: title.into(), artists: vec!["Yo".into()], ..Default::default() };
+        let mut used = std::collections::HashSet::new();
+        let d = Path::new("d");
+        let names: Vec<String> =
+            ["Intro", "Intro", "INTRO", "Otra", "Intro"].iter().map(|n| unique_track_path(d, &t(n), "mp3", &mut used).file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["Yo - Intro.mp3", "Yo - Intro (2).mp3", "Yo - INTRO (3).mp3", "Yo - Otra.mp3", "Yo - Intro (4).mp3"]);
+    }
+
+    #[test]
     fn nombre_seguro_evita_nombres_de_windows() {
         assert_eq!(safe_name("CON"), "_CON");
         assert_eq!(safe_name("com1"), "_com1");
@@ -404,3 +429,132 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod execute_tests {
+    use super::*;
+    use crate::testutil::{pattern, FakeServer, Reply};
+    use crate::new_agent;
+
+    fn format(url: &str, kind: Kind, codec: &str) -> Format {
+        Format { itag: 0, url: url.into(), kind, codec: codec.into(), height: 360, fps: 0, bitrate: 0, size: 0 }
+    }
+
+    fn info(formats: Vec<Format>) -> VideoInfo {
+        VideoInfo { service: "test", id: "1".into(), title: "T".into(), author: None, seconds: 1, formats, cover_url: None, headers: vec![] }
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("resonda-exec-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn files(d: &Path) -> Vec<String> {
+        let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn run(plan: &Plan, info: &VideoInfo, out: &Path, output: Output, tags: Option<&Tags>, cancel: &AtomicBool) -> Res<()> {
+        execute(&new_agent(), info, plan, out, Target { output, tags }, &|_, _, _| {}, cancel)
+    }
+
+    #[test]
+    fn un_mp4_directo_se_guarda_tal_cual_y_sin_temporales() {
+        let data = pattern(5_000);
+        let s = FakeServer::ok(data.clone());
+        let f = format(&format!("{}/v", s.url), Kind::Muxed, "avc1");
+        let d = dir("direct");
+        let out = d.join("v.mp4");
+        run(&Plan::Direct(f.clone()), &info(vec![f]), &out, Output::Mp4, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+        assert_eq!(files(&d), ["v.mp4"]);
+    }
+
+    #[test]
+    fn un_fallo_no_toca_el_archivo_que_ya_existia_ni_deja_temporales() {
+        let s = FakeServer::start(pattern(100), |_| Reply::Status(404));
+        let f = format(&format!("{}/v", s.url), Kind::Muxed, "avc1");
+        let d = dir("keep");
+        let out = d.join("v.mp4");
+        std::fs::write(&out, b"mi archivo anterior").unwrap();
+        let e = run(&Plan::Direct(f.clone()), &info(vec![f]), &out, Output::Mp4, None, &AtomicBool::new(false)).unwrap_err();
+        assert!(e.to_string().contains("ya no está"), "{e}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"mi archivo anterior");
+        assert_eq!(files(&d), ["v.mp4"]);
+    }
+
+    #[test]
+    fn si_falla_el_audio_se_borra_tambien_el_video_ya_bajado() {
+        // El vídeo baja bien y el audio da 404: no debe quedar ningún .part
+        let s = FakeServer::start(pattern(2_000), |r| if r.path.starts_with("/audio") { Reply::Status(404) } else { Reply::Normal });
+        let (v, a) = (format(&format!("{}/video", s.url), Kind::Video, "avc1"), format(&format!("{}/audio", s.url), Kind::Audio, "mp4a"));
+        let d = dir("merge");
+        let out = d.join("v.mp4");
+        let plan = Plan::Merge { video: Some(v.clone()), audio: a.clone() };
+        assert!(run(&plan, &info(vec![v, a]), &out, Output::Mp4, None, &AtomicBool::new(false)).is_err());
+        assert!(files(&d).is_empty(), "{:?}", files(&d));
+    }
+
+    #[test]
+    fn cancelar_antes_de_empezar_no_deja_nada() {
+        let s = FakeServer::ok(pattern(1_000));
+        let f = format(&format!("{}/v", s.url), Kind::Muxed, "avc1");
+        let d = dir("cancel");
+        let out = d.join("v.mp4");
+        let e = run(&Plan::Direct(f.clone()), &info(vec![f]), &out, Output::Mp4, None, &AtomicBool::new(true)).unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some());
+        assert!(files(&d).is_empty());
+    }
+
+    #[test]
+    fn el_sonido_mp3_se_guarda_con_etiquetas_sin_recodificar() {
+        let mut mp3 = vec![0xff, 0xfb, 0x90, 0x00];
+        mp3.extend(pattern(3_000));
+        let s = FakeServer::ok(mp3.clone());
+        let sound = format(&format!("{}/sound", s.url), Kind::Audio, "sound");
+        let d = dir("sound");
+        let out = d.join("a.mp3");
+        let tags = Tags { title: "Título".into(), artist: "Yo".into(), ..Default::default() };
+        run(&Plan::Extract(sound.clone()), &info(vec![sound]), &out, Output::Mp3(0), Some(&tags), &AtomicBool::new(false)).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"ID3") && bytes.ends_with(&mp3));
+        assert_eq!(files(&d), ["a.mp3"]);
+    }
+
+    #[test]
+    fn un_mp3_no_se_puede_pasar_a_m4a_y_el_error_lo_dice() {
+        let mut mp3 = vec![0xff, 0xfb, 0x90, 0x00];
+        mp3.extend(pattern(500));
+        let s = FakeServer::ok(mp3);
+        let sound = format(&format!("{}/sound", s.url), Kind::Audio, "sound");
+        let d = dir("m4a");
+        let e = run(&Plan::Extract(sound.clone()), &info(vec![sound]), &d.join("a.m4a"), Output::Mp4, None, &AtomicBool::new(false)).unwrap_err();
+        assert!(e.to_string().contains("MP3") && e.to_string().contains("sin recodificar"), "{e}");
+        assert!(files(&d).is_empty());
+    }
+
+    #[test]
+    fn datos_que_no_son_audio_dan_error_y_no_dejan_archivos() {
+        let s = FakeServer::ok("esto no es un archivo de audio ni de vídeo".repeat(20).into_bytes());
+        let sound = format(&format!("{}/sound", s.url), Kind::Audio, "sound");
+        for output in [Output::Mp3(0), Output::Wav, Output::Flac, Output::Adts, Output::Mp4] {
+            let d = dir("garbage");
+            let r = run(&Plan::Extract(sound.clone()), &info(vec![sound.clone()]), &d.join("a.out"), output, None, &AtomicBool::new(false));
+            assert!(r.is_err(), "{output:?}");
+            assert!(files(&d).is_empty(), "{output:?}: {:?}", files(&d));
+        }
+    }
+
+    #[test]
+    fn el_plan_de_un_servicio_solo_audio_no_ofrece_video() {
+        let sound = format("http://x/s", Kind::Audio, "sound");
+        let i = info(vec![sound]);
+        assert!(matches!(plan(&i, u32::MAX, true).unwrap(), Plan::Extract(_)));
+        let e = plan(&i, u32::MAX, false).unwrap_err().to_string();
+        assert!(e.contains("solo tiene audio"), "{e}");
+        assert!(plan(&info(vec![]), u32::MAX, true).is_err());
+    }
+}

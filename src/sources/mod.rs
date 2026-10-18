@@ -52,6 +52,28 @@ pub fn fetch_info(agent: &ureq::Agent, input: &str) -> Res<VideoInfo> {
     }
 }
 
+type Resp = ureq::http::Response<ureq::Body>;
+
+/// Hace una petición y la repite (hasta 3 veces, con espera creciente) si falla la red o el servidor
+/// responde 429 o 5xx. Cualquier otro código se devuelve tal cual para que lo interprete quien llama.
+pub fn retry_call(f: impl FnMut() -> Result<Resp, ureq::Error>) -> Res<Resp> {
+    retry_call_with(300, f)
+}
+
+pub(crate) fn retry_call_with(backoff_ms: u64, mut f: impl FnMut() -> Result<Resp, ureq::Error>) -> Res<Resp> {
+    let mut last = None;
+    for n in 1..=3u64 {
+        match f() {
+            Ok(r) if !matches!(r.status().as_u16(), 429 | 500..=599) => return Ok(r),
+            r => last = Some(r),
+        }
+        if n < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms * n * n));
+        }
+    }
+    Ok(last.expect("al menos un intento")?)
+}
+
 /// Servidor de un enlace en minúsculas y sin `www.` (`None` si no parece una URL).
 pub fn host_of(input: &str) -> Option<String> {
     let rest = input.split_once("://").map_or(input, |(_, r)| r);
@@ -128,6 +150,36 @@ pub fn cookie_header(headers: &ureq::http::HeaderMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{pattern, FakeServer, Reply};
+
+    #[test]
+    fn retry_call_reintenta_5xx_y_errores_de_red() {
+        let agent = crate::new_agent();
+        let s = FakeServer::start(pattern(10), |r| if r.n < 2 { Reply::Status(503) } else { Reply::Normal });
+        let r = retry_call_with(1, || agent.get(format!("{}/x", s.url)).call()).unwrap();
+        assert_eq!((r.status().as_u16(), s.hits()), (200, 3));
+
+        // Si no se arregla, se devuelve el último código para que quien llama lo explique
+        let s = FakeServer::start(pattern(10), |_| Reply::Status(500));
+        let r = retry_call_with(1, || agent.get(format!("{}/x", s.url)).call()).unwrap();
+        assert_eq!((r.status().as_u16(), s.hits()), (500, 3));
+
+        // Los códigos definitivos no se repiten
+        let s = FakeServer::start(pattern(10), |_| Reply::Status(404));
+        let r = retry_call_with(1, || agent.get(format!("{}/x", s.url)).call()).unwrap();
+        assert_eq!((r.status().as_u16(), s.hits()), (404, 1));
+
+        // Sin servidor: error de red, tras los 3 intentos
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let n = std::cell::Cell::new(0);
+        let e = retry_call_with(1, || {
+            n.set(n.get() + 1);
+            agent.get(format!("http://127.0.0.1:{port}/")).call()
+        });
+        assert!(e.is_err() && n.get() == 3);
+    }
 
     #[test]
     fn servidores() {
@@ -137,6 +189,44 @@ mod tests {
         assert!(on_domain("https://vm.tiktok.com/abc", "tiktok.com"));
         assert!(!on_domain("https://nottiktok.com/abc", "tiktok.com"));
         assert!(!on_domain("https://evil.com/tiktok.com", "tiktok.com"));
+    }
+
+    #[test]
+    fn enlaces_basura_no_hacen_panico() {
+        use crate::testutil::Rng;
+        const PIEZAS: &[&str] = &[
+            "https://", "http://", "www.", "m.", "music.", "youtube.com", "youtu.be", "tiktok.com", "vm.tiktok.com", "twitch.tv", "clips.twitch.tv",
+            "bandcamp.com", "deezer.com", "music.apple.com", "tidal.com", "open.spotify.com", "spotify:", "/", "//", "?", "&", "=", "#", "@", ":", ";",
+            "video", "clip", "track", "album", "playlist", "song", "watch", "v=", "i=", "embed", "en", "us", "pt-br", "browse", "é", "日本", "\u{0}",
+            "%20", " ", "..", "dQw4w9WgXcQ", "12345", "pl.abc", "99999999999999999999999", "-", "_", "\t", "\n",
+        ];
+        let mut rng = Rng(0xc0ff_ee11);
+        for _ in 0..30_000 {
+            let s: String = (0..1 + rng.below(14)).map(|_| *rng.pick(PIEZAS)).collect();
+            let _ = (host_of(&s), on_domain(&s, "tiktok.com"), html_unescape(&s), percent_encode(&s), crate::pipeline::safe_name(&s));
+            let _ = (find(&s).map(|e| e.id()), find_catalog(&s).map(|c| c.0.id()), youtube::parse_video_id(&s), twitch::clip_slug(&s));
+            for e in EXTRACTORS {
+                let _ = e.matches(&s);
+            }
+            for c in CATALOGS {
+                let _ = c.parse(&s);
+            }
+            let _ = (catalog::path_segments(&s), catalog::query_param(&s, "i"), catalog::iso_duration_ms(&s), catalog::ld_json(&s));
+        }
+    }
+
+    #[test]
+    fn un_enlace_solo_lo_reconoce_un_servicio() {
+        // Ningún enlace de los ejemplos cae en dos servicios a la vez
+        let enlaces = [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", "https://www.tiktok.com/@a/video/1", "https://vm.tiktok.com/ZM1/",
+            "https://clips.twitch.tv/AbCd-123", "https://banditcamp.bandcamp.com/track/track-i", "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+            "https://www.deezer.com/en/track/3135556", "https://music.apple.com/us/album/discovery/697194953", "https://tidal.com/browse/track/1493005",
+        ];
+        for e in enlaces {
+            let hits = EXTRACTORS.iter().filter(|x| x.matches(e)).count() + CATALOGS.iter().filter(|c| c.parse(e).is_some()).count();
+            assert_eq!(hits, 1, "{e} lo reconocen {hits} servicios");
+        }
     }
 
     #[test]

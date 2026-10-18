@@ -3,7 +3,7 @@
 
 use crate::sources::catalog::{path_segments, Catalog};
 use crate::sources::spotify::{Collection, Kind, Track};
-use crate::sources::{on_domain, spotify};
+use crate::sources::{on_domain, retry_call, spotify};
 use crate::Res;
 use serde_json::Value;
 
@@ -75,7 +75,7 @@ impl Catalog for Deezer {
 }
 
 fn get(agent: &ureq::Agent, url: &str) -> Res<Value> {
-    let mut resp = agent.get(url).header("User-Agent", spotify::BROWSER_UA).call()?;
+    let mut resp = retry_call(|| agent.get(url).header("User-Agent", spotify::BROWSER_UA).call())?;
     if !resp.status().is_success() {
         return Err(format!("Deezer respondió HTTP {}", resp.status().as_u16()).into());
     }
@@ -115,6 +115,20 @@ mod tests {
         assert_eq!(p("https://www.deezer.com/pt-br/track/1"), Some((Kind::Track, "1".into())));
         assert_eq!(p("https://www.deezer.com/en/artist/27"), None);
         assert_eq!(p("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"), None);
+    }
+
+    #[test]
+    fn fichas_danadas_no_hacen_panico() {
+        let json = r#"{"id":3135556,"title":"Harder","duration":226,"release_date":"2001-03-12","artist":{"name":"Daft Punk"},"contributors":[{"name":"Daft Punk"}],"album":{"title":"Discovery","cover_xl":"https://x/c.jpg"}}"#;
+        let mut rng = crate::testutil::Rng(16);
+        for text in crate::testutil::mutations(json, &mut rng, 3000) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                let _ = track_of(&v, Some("A"), Some("2000"));
+            }
+        }
+        for weird in ["null", "[]", r#"{"id":"x","duration":-1,"contributors":7,"album":[]}"#, r#"{"title":null,"artist":5}"#] {
+            let _ = track_of(&serde_json::from_str::<Value>(weird).unwrap(), None, None);
+        }
     }
 
     #[test]

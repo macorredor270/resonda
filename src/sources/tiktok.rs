@@ -6,7 +6,7 @@
 // Si TikTok cambia algo, lo normal es que solo haya que tocar `info_from_html`.
 
 use crate::sources::youtube::{Format, Kind, VideoInfo};
-use crate::sources::{cookie_header, on_domain, Extractor};
+use crate::sources::{cookie_header, on_domain, retry_call, Extractor};
 use crate::Res;
 use serde_json::Value;
 use std::time::Duration;
@@ -29,11 +29,7 @@ impl Extractor for TikTok {
     fn extract(&self, agent: &ureq::Agent, input: &str) -> Res<VideoInfo> {
         let url = if input.contains("://") { input.to_string() } else { format!("https://{input}") };
         let url = resolve_short_link(&url)?;
-        let mut resp = agent
-            .get(&url)
-            .header("User-Agent", UA)
-            .header("Accept-Language", "en-us,en;q=0.5")
-            .call()?;
+        let mut resp = retry_call(|| agent.get(&url).header("User-Agent", UA).header("Accept-Language", "en-us,en;q=0.5").call())?;
         if !resp.status().is_success() {
             return Err(format!("TikTok respondió HTTP {}", resp.status().as_u16()).into());
         }
@@ -63,7 +59,7 @@ fn resolve_short_link(url: &str) -> Res<String> {
         if current.contains("/video/") || current.contains("/photo/") {
             return Ok(current);
         }
-        let resp = agent.get(&current).header("User-Agent", UA).call()?;
+        let resp = retry_call(|| agent.get(&current).header("User-Agent", UA).call())?;
         let next = resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or("El enlace corto de TikTok no redirige a ningún vídeo")?;
         current = if next.starts_with("http") { next.to_string() } else { format!("https://www.tiktok.com{next}") };
     }
@@ -191,6 +187,21 @@ mod tests {
         assert_eq!(crate::pipeline::original_sound(&i).map(|f| f.url.as_str()), Some("https://x/sound.mp3"));
         assert!(i.headers.contains(&("Cookie".into(), "a=1; b=2".into())));
         assert!(i.headers.iter().any(|(k, v)| k == "Referer" && v.contains("tiktok.com")));
+    }
+
+    #[test]
+    fn paginas_danadas_no_hacen_panico() {
+        let json = r#"{"__DEFAULT_SCOPE__":{"webapp.video-detail":{"statusCode":0,"itemInfo":{"itemStruct":{"id":"123","desc":"Hola","author":{"uniqueId":"ana"},
+            "music":{"original":true,"playUrl":"https://x/s.mp3"},"video":{"duration":24,"cover":"https://x/c.jpg","bitrateInfo":[
+            {"QualityType":20,"Bitrate":900,"CodecType":"h264","PlayAddr":{"UrlList":["https://x/h264"],"DataSize":"400","Width":576,"Height":1024}}]}}}}}}"#;
+        let mut rng = crate::testutil::Rng(11);
+        for page in crate::testutil::mutations(&page(json), &mut rng, 3000) {
+            let _ = info_from_html(&page, "a=1");
+        }
+        // formas inesperadas pero JSON válido: números donde van textos, listas donde van objetos...
+        for weird in [r#"{"__DEFAULT_SCOPE__":[]}"#, r#"{"__DEFAULT_SCOPE__":{"webapp.video-detail":7}}"#, r#"{"__DEFAULT_SCOPE__":{"webapp.video-detail":{"itemInfo":{"itemStruct":{"video":{"bitrateInfo":"x","duration":"no"},"id":5,"music":[],"author":3}}}}}"#, "null", "[]", "1"] {
+            let _ = info_from_html(&page(weird), "");
+        }
     }
 
     #[test]

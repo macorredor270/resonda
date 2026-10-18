@@ -33,6 +33,7 @@ Opciones:
   -V, --version          Mostrar la versión
   -h, --help             Esta ayuda";
 
+#[derive(Debug, PartialEq)]
 struct Options {
     quality: String,
     output: Option<PathBuf>,
@@ -44,17 +45,36 @@ struct Options {
     inputs: Vec<String>,
 }
 
-fn parse_args() -> Res<Option<Options>> {
+/// Qué se pidió en la línea de comandos.
+#[derive(Debug, PartialEq)]
+enum Command {
+    Run(Options),
+    Help,
+    Version,
+    Services,
+}
+
+const FORMATS: [&str; 6] = ["mp4", "mp3", "flac", "wav", "m4a", "aac"];
+
+/// Lee los argumentos sin tocar la red ni terminar el proceso, y rechaza ya lo que no tiene sentido
+/// (formato, calidad, número de canciones...), antes de descargar nada.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Res<Command> {
     let mut o = Options { quality: "1080".into(), output: None, dir: ".".into(), format: "mp4".into(), bitrate: 0, list: false, limit: None, inputs: vec![] };
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
+    let mut any = false;
     while let Some(arg) = args.next() {
+        any = true;
         // Admite "--opcion=valor"
         let (flag, inline) = match arg.split_once('=') {
             Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
             _ => (arg.clone(), None),
         };
         let mut value = |name: &str| -> Res<String> {
-            inline.clone().or_else(|| args.next()).ok_or_else(|| format!("Falta el valor de {name}").into())
+            let v = inline.clone().or_else(|| args.next()).ok_or_else(|| format!("Falta el valor de {name}"))?;
+            if v.is_empty() {
+                return Err(format!("El valor de {name} está vacío").into());
+            }
+            Ok(v)
         };
         match flag.as_str() {
             "-q" | "--quality" => o.quality = value("--quality")?,
@@ -64,31 +84,33 @@ fn parse_args() -> Res<Option<Options>> {
             "-f" | "--format" => o.format = value("--format")?.to_lowercase(),
             "-b" | "--bitrate" => o.bitrate = value("--bitrate")?.parse().map_err(|_| "El valor de --bitrate debe ser un número")?,
             "-l" | "--list" => o.list = true,
-            "-n" | "--limit" => {
-                o.limit = Some(value("--limit")?.parse().map_err(|_| "El valor de --limit debe ser un número")?)
-            }
-            "-S" | "--services" => {
-                for e in EXTRACTORS {
-                    println!("{:<10} {}", e.id(), e.name());
-                }
-                for c in CATALOGS {
-                    println!("{:<10} {} (solo metadatos; el audio sale de YouTube)", c.id(), c.name());
-                }
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("resonda {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            "-h" | "--help" => return Ok(None),
+            "-n" | "--limit" => o.limit = Some(value("--limit")?.parse().map_err(|_| "El valor de --limit debe ser un número")?),
+            "-S" | "--services" => return Ok(Command::Services),
+            "-V" | "--version" => return Ok(Command::Version),
+            "-h" | "--help" => return Ok(Command::Help),
             f if f.starts_with('-') && f.len() > 1 => return Err(format!("Opción desconocida: {f}").into()),
             _ => o.inputs.push(arg),
         }
     }
+    if !FORMATS.contains(&o.format.as_str()) {
+        return Err(format!("Formato no soportado: \"{}\" (usa mp4, mp3, flac, wav, m4a o aac)", o.format).into());
+    }
+    if o.quality != "best" && o.quality.parse::<u32>().ok().filter(|&h| h > 0).is_none() {
+        return Err(format!("Calidad no válida: \"{}\" (un número de píxeles como 720, o \"best\")", o.quality).into());
+    }
     if o.bitrate != 0 && ![128, 192, 256, 320].contains(&o.bitrate) {
         return Err("El valor de --bitrate debe ser 128, 192, 256 o 320".into());
     }
-    Ok(Some(o))
+    if o.limit == Some(0) {
+        return Err("El valor de --limit debe ser al menos 1".into());
+    }
+    if o.output.is_some() && o.inputs.len() > 1 {
+        return Err("--output solo se puede usar con un enlace".into());
+    }
+    if o.inputs.is_empty() {
+        return if any { Err("Falta el enlace".into()) } else { Ok(Command::Help) };
+    }
+    Ok(Command::Run(o))
 }
 
 fn mb(n: u64) -> String {
@@ -181,11 +203,8 @@ fn fetch_one(agent: &ureq::Agent, opts: &Options, input: &str) -> Res<()> {
         opts
     };
 
-    let max_height: u32 = if opts.quality == "best" {
-        u32::MAX
-    } else {
-        opts.quality.parse().ok().filter(|&h| h > 0).ok_or_else(|| format!("Calidad no válida: \"{}\"", opts.quality))?
-    };
+    // La calidad ya se validó al leer los argumentos
+    let max_height: u32 = if opts.quality == "best" { u32::MAX } else { opts.quality.parse().unwrap_or(1080) };
 
     let (output, audio_only) = output_of(opts)?;
     let plan = pipeline::plan(&info, max_height, audio_only)?;
@@ -234,19 +253,24 @@ fn catalog_one(agent: &ureq::Agent, opts: &Options, catalog: &dyn Catalog, kind:
     let dir = if kind == SpotKind::Track { opts.dir.clone() } else { opts.dir.join(pipeline::safe_name(&col.name)) };
     let total = col.tracks.len().min(opts.limit.unwrap_or(usize::MAX));
     let (mut failed, cancel) = (0, AtomicBool::new(false));
+    let mut used = std::collections::HashSet::new();
+    let ext = format.extension(true);
     for (i, t) in col.tracks.iter().take(total).enumerate() {
         let t = if kind == SpotKind::Track { t.clone() } else { catalog.refine(agent, t) };
         print!("[{}/{}] {} ... ", i + 1, total, t.label());
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        let output = (kind == SpotKind::Track).then_some(opts.output.as_deref()).flatten();
-        match pipeline::download_spotify_track(agent, &t, &dir, output, format, &|_, _, _| {}, &cancel) {
+        let path = match (kind == SpotKind::Track).then_some(opts.output.clone()).flatten() {
+            Some(p) => p,
+            None => pipeline::unique_track_path(&dir, &t, ext, &mut used),
+        };
+        match pipeline::download_spotify_track(agent, &t, &dir, Some(&path), format, &|_, _, _| {}, &cancel) {
             Ok((path, m)) => {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 println!("✓ {} MB  (coincidencia {:.0}%: «{}»)", mb(size), m.score, m.title);
             }
             Err(e) => {
                 failed += 1;
-                println!("✗ {e}");
+                println!("✗ {}", resonda::explain(&*e));
             }
         }
     }
@@ -259,22 +283,40 @@ fn catalog_one(agent: &ureq::Agent, opts: &Options, catalog: &dyn Catalog, kind:
     Ok(())
 }
 
+fn print_services() {
+    for e in EXTRACTORS {
+        println!("{:<10} {}", e.id(), e.name());
+    }
+    for c in CATALOGS {
+        println!("{:<10} {} (solo metadatos; el audio sale de YouTube)", c.id(), c.name());
+    }
+}
+
 fn main() {
-    let opts = match parse_args() {
-        Ok(Some(o)) if !o.inputs.is_empty() => o,
-        Ok(other) => {
+    // Un fallo interno no debe enseñar un volcado en inglés: se avisa de que es un error del programa
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("Error interno de Resonda: {info}\nSi puedes, cuéntalo en https://github.com/macorredor270/resonda/issues con el enlace que usaste.");
+    }));
+
+    let opts = match parse_args(std::env::args().skip(1)) {
+        Ok(Command::Run(o)) => o,
+        Ok(Command::Help) => {
             println!("{HELP}");
-            std::process::exit(if other.is_none() { 0 } else { 1 });
+            std::process::exit(0);
+        }
+        Ok(Command::Version) => {
+            println!("resonda {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Ok(Command::Services) => {
+            print_services();
+            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("Error: {e}\n\n{HELP}");
             std::process::exit(2);
         }
     };
-    if opts.output.is_some() && opts.inputs.len() > 1 {
-        eprintln!("Error: --output solo se puede usar con un vídeo");
-        std::process::exit(2);
-    }
 
     let agent = new_agent();
 
@@ -286,8 +328,93 @@ fn main() {
         };
         if let Err(e) = result {
             failed += 1;
-            eprintln!("Error ({input}): {e}");
+            eprintln!("Error ({input}): {}", resonda::explain(&*e));
         }
     }
     std::process::exit(if failed > 0 { 1 } else { 0 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Res<Command> {
+        parse_args(s.split_whitespace().map(str::to_string))
+    }
+
+    fn run(s: &str) -> Options {
+        match args(s).unwrap() {
+            Command::Run(o) => o,
+            other => panic!("se esperaba Run, salió {other:?}"),
+        }
+    }
+
+    fn err(s: &str) -> String {
+        args(s).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn valores_por_defecto() {
+        let o = run("https://youtu.be/dQw4w9WgXcQ");
+        assert_eq!((o.format.as_str(), o.quality.as_str(), o.bitrate, o.limit, o.list), ("mp4", "1080", 0, None, false));
+        assert_eq!(o.inputs, ["https://youtu.be/dQw4w9WgXcQ"]);
+    }
+
+    #[test]
+    fn opciones_cortas_largas_y_con_igual() {
+        let a = run("-f mp3 -b 256 -q 720 -d salida -n 3 enlace");
+        let b = run("--format=MP3 --bitrate=256 --quality=720 --dir=salida --limit=3 enlace");
+        assert_eq!(a, b);
+        assert_eq!((a.format.as_str(), a.bitrate, a.dir, a.limit), ("mp3", 256, PathBuf::from("salida"), Some(3)));
+        assert_eq!(run("-a enlace").format, "m4a");
+        assert_eq!(run("-q best enlace").quality, "best");
+        assert!(run("-l enlace").list);
+        assert_eq!(run("-o a.mp4 enlace").output, Some(PathBuf::from("a.mp4")));
+    }
+
+    #[test]
+    fn varios_enlaces_y_ordenes_mezclados() {
+        let o = run("uno -f flac dos --dir x tres");
+        assert_eq!(o.inputs, ["uno", "dos", "tres"]);
+    }
+
+    #[test]
+    fn comandos_sueltos() {
+        assert_eq!(args("-h").unwrap(), Command::Help);
+        assert_eq!(args("--help enlace").unwrap(), Command::Help);
+        assert_eq!(args("-V").unwrap(), Command::Version);
+        assert_eq!(args("--services").unwrap(), Command::Services);
+        assert_eq!(args("").unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn rechaza_lo_que_no_tiene_sentido_antes_de_usar_la_red() {
+        assert!(err("--formato mp3 x").contains("Opción desconocida"));
+        assert!(err("x -f").contains("Falta el valor de --format"));
+        assert!(err("x -f ogg").contains("Formato no soportado"));
+        assert!(err("x -q 0").contains("Calidad no válida"));
+        assert!(err("x -q -5").contains("Calidad no válida"));
+        assert!(err("x -q alta").contains("Calidad no válida"));
+        assert!(err("x -b 100").contains("128, 192, 256 o 320"));
+        assert!(err("x -b mucho").contains("debe ser un número"));
+        assert!(err("x -n 0").contains("al menos 1"));
+        assert!(err("x -n -1").contains("debe ser un número"));
+        assert!(err("x --dir=").contains("vacío"));
+        assert!(err("a b -o salida.mp4").contains("solo se puede usar con un enlace"));
+    }
+
+    #[test]
+    fn sin_enlace_es_un_error_y_sin_nada_es_la_ayuda() {
+        assert!(err("-f mp3").contains("Falta el enlace"));
+        assert!(err("-l").contains("Falta el enlace"));
+        assert_eq!(run("-l -f flac enlace").inputs.len(), 1);
+    }
+
+    #[test]
+    fn entradas_raras_no_hacen_panico() {
+        for input in ["-", "--", "=", "--=", "-=", "--format==mp3", "é", "\u{0}", "-f=mp3", "--limit=99999999999999999999"] {
+            let _ = parse_args([input.to_string()]);
+            let _ = parse_args([input.to_string(), "x".to_string()]);
+        }
+    }
 }

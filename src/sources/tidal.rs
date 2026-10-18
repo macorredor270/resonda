@@ -4,7 +4,7 @@
 
 use crate::sources::catalog::{iso_duration_ms, ld_json, path_segments, Catalog};
 use crate::sources::spotify::{Collection, Kind, Track, BROWSER_UA};
-use crate::sources::on_domain;
+use crate::sources::{on_domain, retry_call};
 use crate::Res;
 use serde_json::Value;
 
@@ -40,7 +40,8 @@ impl Catalog for Tidal {
         if kind != Kind::Track {
             return Err("Tidal: solo se pueden leer canciones sueltas (los álbumes y las playlists no muestran su lista sin iniciar sesión); pega el enlace de una canción".into());
         }
-        let mut resp = agent.get(format!("https://tidal.com/browse/track/{id}")).header("User-Agent", BROWSER_UA).call()?;
+        let url = format!("https://tidal.com/browse/track/{id}");
+        let mut resp = retry_call(|| agent.get(&url).header("User-Agent", BROWSER_UA).call())?;
         if !resp.status().is_success() {
             return Err(format!("Tidal respondió HTTP {} (¿la canción no existe?)", resp.status().as_u16()).into());
         }
@@ -88,6 +89,18 @@ mod tests {
         assert_eq!(p("https://tidal.com/browse/playlist/299887f1-3cab-437a-82f6-605e62381477").map(|x| x.0), Some(Kind::Playlist));
         assert_eq!(p("https://tidal.com/browse/artist/8847"), None);
         assert_eq!(p("https://tidal.com/browse/track/abc"), None);
+    }
+
+    #[test]
+    fn paginas_danadas_no_hacen_panico() {
+        let html = r#"<script type="application/ld+json">{"@type":"MusicRecording","name":"One More Time","duration":"PT5M20S","byArtist":[{"name":"Daft Punk"}],"image":"https://x/640.jpg","inAlbum":{"name":"A"}}</script>"#;
+        let mut rng = crate::testutil::Rng(15);
+        for h in crate::testutil::mutations(html, &mut rng, 3000) {
+            let _ = track_from_html(&h, "1");
+        }
+        for weird in [r#"{"@type":"MusicRecording"}"#, r#"{"@type":"MusicRecording","name":5,"byArtist":7}"#, r#"[]"#, r#"{"@type":"MusicRecording","name":"x","byArtist":"Daft","duration":"PT"}"#, r#"{"@type":"MusicRecording","name":"x","byArtist":{"name":"A"},"duration":"PT99999999999999999999S"}"#] {
+            let _ = track_from_html(&format!("<script type=\"application/ld+json\">{weird}</script>"), "1");
+        }
     }
 
     #[test]

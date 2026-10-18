@@ -191,6 +191,25 @@ resonda-gui [enlace]
 
 Para generar los paquetes de Linux: `packaging/build-linux.sh` (deja `.tar.gz`, `.deb` y AppImage en `dist/`).
 
+## Pruebas
+
+`make test` (o `cargo test --release`) ejecuta 90 pruebas que no necesitan internet. Lo que cubren:
+
+- **Descarga contra un servidor HTTP falso** (`src/testutil.rs`) que se porta mal a propósito: reintenta los
+  fallos pasajeros (500, 429, conexión cortada), no reintenta los definitivos (403, 404, 410, 416), no acepta
+  nunca un trozo equivocado (servidor que ignora `Range`), respeta «cancelar» también durante las esperas,
+  y comprueba que un fallo **no toca un archivo que ya existía ni deja `.part`** sueltos.
+- **Archivos dañados**: MP4 (normales y fragmentados) truncados en todas las longitudes y con bytes cambiados,
+  tablas incoherentes, MP3 corruptos o basura, y casos límite de WAV y FLAC (vacío, una muestra, número impar…):
+  siempre error, nunca pánico.
+- **Ida y vuelta de audio**: un tono se codifica a MP3 y se decodifica, y se comprueba formato, duración y nivel.
+- **Páginas y JSON de cada servicio** con miles de variantes dañadas (recortes, comillas cambiadas, tipos
+  inesperados), y 30 000 enlaces aleatorios, para que un cambio en un servicio dé un error claro y no un pánico.
+- **Línea de comandos**: argumentos válidos y no válidos, rechazados antes de tocar la red.
+
+Los servicios reales (YouTube, TikTok…) no se llaman en las pruebas porque cambian sin avisar; cada uno
+tiene un ejemplo fijo de su página. Para comprobar un servicio de verdad, ejecuta la terminal con un enlace.
+
 ## Añadir un servicio
 
 Cada servicio es un tipo que implementa `Extractor` ([`src/sources/mod.rs`](src/sources/mod.rs)):

@@ -235,6 +235,7 @@ fn fetch_player(agent: &ureq::Agent, client: &Client, session: &Session, video_i
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
+    let build = || {
     let mut req = agent
         .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
         .header("User-Agent", client.ua)
@@ -248,7 +249,9 @@ fn fetch_player(agent: &ureq::Agent, client: &Client, session: &Session, video_i
     if !session.cookies.is_empty() {
         req = req.header("Cookie", &session.cookies);
     }
-    let mut resp = req.send_json(&body)?;
+    req
+    };
+    let mut resp = crate::sources::retry_call(|| build().send_json(&body))?;
     if !resp.status().is_success() {
         return Err(format!("YouTube respondió HTTP {}", resp.status().as_u16()).into());
     }
@@ -490,6 +493,7 @@ pub fn search(agent: &ureq::Agent, query: &str) -> Res<Vec<SearchResult>> {
         "query": query,
         "params": "EgIQAQ%3D%3D", // filtro: solo vídeos
     });
+    let build = || {
     let mut req = agent
         .post("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
         .header("User-Agent", VISIONOS_UA)
@@ -502,7 +506,9 @@ pub fn search(agent: &ureq::Agent, query: &str) -> Res<Vec<SearchResult>> {
     if !session.cookies.is_empty() {
         req = req.header("Cookie", &session.cookies);
     }
-    let mut resp = req.send_json(&body)?;
+    req
+    };
+    let mut resp = crate::sources::retry_call(|| build().send_json(&body))?;
     if !resp.status().is_success() {
         return Err(format!("La búsqueda de YouTube respondió HTTP {}", resp.status().as_u16()).into());
     }

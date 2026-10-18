@@ -4,7 +4,7 @@
 
 use crate::sources::catalog::{path_segments, query_param, Catalog};
 use crate::sources::spotify::{Collection, Kind, Track, BROWSER_UA};
-use crate::sources::on_domain;
+use crate::sources::{on_domain, retry_call};
 use crate::Res;
 use serde_json::Value;
 
@@ -46,10 +46,8 @@ impl Catalog for AppleMusic {
             return Err("Apple Music: las playlists aún no están soportadas; pega el enlace de un álbum o de una canción".into());
         }
         let (country, id) = id.split_once('/').unwrap_or(("us", id));
-        let mut resp = agent
-            .get(format!("https://itunes.apple.com/lookup?id={id}&entity=song&country={country}"))
-            .header("User-Agent", BROWSER_UA)
-            .call()?;
+        let url = format!("https://itunes.apple.com/lookup?id={id}&entity=song&country={country}");
+        let mut resp = retry_call(|| agent.get(&url).header("User-Agent", BROWSER_UA).call())?;
         if !resp.status().is_success() {
             return Err(format!("Apple Music respondió HTTP {}", resp.status().as_u16()).into());
         }
@@ -106,6 +104,24 @@ mod tests {
         assert_eq!(p("https://music.apple.com/gb/playlist/x/pl.0eb1559b2a614029aa9efe486d8ff293").map(|x| x.0), Some(Kind::Playlist));
         assert_eq!(p("https://music.apple.com/us/artist/daft-punk/5468295"), None);
         assert_eq!(p("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"), None);
+    }
+
+    #[test]
+    fn respuestas_danadas_no_hacen_panico() {
+        let json = r#"{"resultCount":2,"results":[{"wrapperType":"collection","collectionName":"Discovery"},
+            {"wrapperType":"track","kind":"song","trackId":1,"trackName":"One","artistName":"Daft","trackTimeMillis":320357,"releaseDate":"2000-11-30T08:00:00Z","artworkUrl100":"https://x/100x100bb.jpg"}]}"#;
+        let mut rng = crate::testutil::Rng(14);
+        for text in crate::testutil::mutations(json, &mut rng, 3000) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                for kind in [Kind::Track, Kind::Album, Kind::Playlist] {
+                    let _ = collection_from(kind, &v);
+                }
+            }
+        }
+        for weird in [json!(null), json!({"results":7}), json!({"results":[null, 5, "x", []]}), json!({"results":[{"wrapperType":"track","kind":"song","trackId":"x","trackName":5}]})] {
+            let _ = collection_from(Kind::Album, &weird);
+            let _ = collection_from(Kind::Track, &weird);
+        }
     }
 
     #[test]
